@@ -20,7 +20,7 @@ use std::sync::Arc;
 use sp_api::{ProvideRuntimeApi, CallApiAt, NumberFor};
 use sp_blockchain::HeaderBackend;
 use sp_runtime::{
-	Justifications, generic::{BlockId, SignedBlock}, traits::{Block as BlockT, BlakeTwo256},
+	Justification, generic::{BlockId, SignedBlock}, traits::{Block as BlockT, BlakeTwo256},
 };
 use sc_client_api::{Backend as BackendT, BlockchainEvents, KeyIterator};
 use sp_storage::{StorageData, StorageKey, ChildInfo, PrefixedStorageKey};
@@ -30,7 +30,7 @@ use consensus_common::BlockStatus;
 /// A set of APIs that polkadot-like runtimes must implement.
 pub trait RuntimeApiCollection:
 	sp_transaction_pool::runtime_api::TaggedTransactionQueue<Block>
-	+ sp_api::ApiExt<Block>
+	+ sp_api::ApiExt<Block, Error = sp_blockchain::Error>
 	+ babe_primitives::BabeApi<Block>
 	+ grandpa_primitives::GrandpaApi<Block>
 	+ ParachainHost<Block>
@@ -48,7 +48,7 @@ where
 impl<Api> RuntimeApiCollection for Api
 where
 	Api: sp_transaction_pool::runtime_api::TaggedTransactionQueue<Block>
-		+ sp_api::ApiExt<Block>
+		+ sp_api::ApiExt<Block, Error = sp_blockchain::Error>
 		+ babe_primitives::BabeApi<Block>
 		+ grandpa_primitives::GrandpaApi<Block>
 		+ ParachainHost<Block>
@@ -71,6 +71,7 @@ pub trait AbstractClient<Block, Backend>:
 	+ HeaderBackend<Block>
 	+ CallApiAt<
 		Block,
+		Error = sp_blockchain::Error,
 		StateBackend = Backend::State
 	>
 	where
@@ -89,6 +90,7 @@ impl<Block, Backend, Client> AbstractClient<Block, Backend> for Client
 			+ Sized + Send + Sync
 			+ CallApiAt<
 				Block,
+				Error = sp_blockchain::Error,
 				StateBackend = Backend::State
 			>,
 		Client::Api: RuntimeApiCollection<StateBackend = Backend::State>,
@@ -204,15 +206,15 @@ impl sc_client_api::BlockBackend<Block> for Client {
 		}
 	}
 
-	fn justifications(
+	fn justification(
 		&self,
 		id: &BlockId<Block>
-	) -> sp_blockchain::Result<Option<Justifications>> {
+	) -> sp_blockchain::Result<Option<Justification>> {
 		match self {
-			Self::Polkadot(client) => client.justifications(id),
-			Self::Westend(client) => client.justifications(id),
-			Self::Kusama(client) => client.justifications(id),
-			Self::Rococo(client) => client.justifications(id),
+			Self::Polkadot(client) => client.justification(id),
+			Self::Westend(client) => client.justification(id),
+			Self::Kusama(client) => client.justification(id),
+			Self::Rococo(client) => client.justification(id),
 		}
 	}
 
@@ -227,19 +229,6 @@ impl sc_client_api::BlockBackend<Block> for Client {
 			Self::Rococo(client) => client.block_hash(number),
 		}
 	}
-
-	fn indexed_transaction(
-		&self,
-		id: &<Block as BlockT>::Hash
-	) -> sp_blockchain::Result<Option<Vec<u8>>> {
-		match self {
-			Self::Polkadot(client) => client.indexed_transaction(id),
-			Self::Westend(client) => client.indexed_transaction(id),
-			Self::Kusama(client) => client.indexed_transaction(id),
-			Self::Rococo(client) => client.indexed_transaction(id),
-		}
-	}
-
 }
 
 impl sc_client_api::StorageProvider<Block, crate::FullBackend> for Client {

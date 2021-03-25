@@ -22,38 +22,46 @@ use sp_runtime::traits::{
 	BlakeTwo256, IdentityLookup,
 };
 use primitives::v1::{AuthorityDiscoveryId, Balance, BlockNumber, Header, ValidatorIndex};
-use frame_support::parameter_types;
-use frame_support_test::TestRandomness;
+use frame_support::{
+	impl_outer_origin, impl_outer_dispatch, impl_outer_event, parameter_types,
+	traits::Randomness as RandomnessT,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use crate::{
-	inclusion, scheduler, dmp, ump, hrmp, session_info, paras, configuration,
-	initializer, shared,
-};
+use crate::inclusion;
+use crate as parachains;
 
-type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<Test>;
-type Block = frame_system::mocking::MockBlock<Test>;
+/// A test runtime struct.
+#[derive(Clone, Eq, PartialEq)]
+pub struct Test;
 
-frame_support::construct_runtime!(
-	pub enum Test where
-		Block = Block,
-		NodeBlock = Block,
-		UncheckedExtrinsic = UncheckedExtrinsic,
-	{
-		System: frame_system::{Pallet, Call, Config, Storage, Event<T>},
-		Balances: pallet_balances::{Pallet, Call, Storage, Config<T>, Event<T>},
-		Paras: paras::{Pallet, Origin, Call, Storage, Config<T>},
-		Configuration: configuration::{Pallet, Call, Storage, Config<T>},
-		Shared: shared::{Pallet, Call, Storage},
-		Inclusion: inclusion::{Pallet, Call, Storage, Event<T>},
-		Scheduler: scheduler::{Pallet, Call, Storage},
-		Initializer: initializer::{Pallet, Call, Storage},
-		Dmp: dmp::{Pallet, Call, Storage},
-		Ump: ump::{Pallet, Call, Storage},
-		Hrmp: hrmp::{Pallet, Call, Storage, Event},
-		SessionInfo: session_info::{Pallet, Call, Storage},
+impl_outer_origin! {
+	pub enum Origin for Test {
+		parachains
 	}
-);
+}
+
+impl_outer_dispatch! {
+	pub enum Call for Test where origin: Origin {
+		initializer::Initializer,
+	}
+}
+
+impl_outer_event! {
+	pub enum TestEvent for Test {
+		frame_system<T>,
+		pallet_balances<T>,
+		inclusion<T>,
+	}
+}
+
+pub struct TestRandomness;
+
+impl RandomnessT<H256> for TestRandomness {
+	fn random(_subject: &[u8]) -> H256 {
+		Default::default()
+	}
+}
 
 parameter_types! {
 	pub const BlockHashCount: u32 = 250;
@@ -75,10 +83,10 @@ impl frame_system::Config for Test {
 	type AccountId = u64;
 	type Lookup = IdentityLookup<u64>;
 	type Header = Header;
-	type Event = Event;
+	type Event = TestEvent;
 	type BlockHashCount = BlockHashCount;
 	type Version = ();
-	type PalletInfo = PalletInfo;
+	type PalletInfo = ();
 	type AccountData = pallet_balances::AccountData<u128>;
 	type OnNewAccount = ();
 	type OnKilledAccount = ();
@@ -93,7 +101,7 @@ parameter_types! {
 impl pallet_balances::Config for Test {
 	type MaxLocks = ();
 	type Balance = Balance;
-	type Event = Event;
+	type Event = TestEvent;
 	type DustRemoval = ();
 	type ExistentialDeposit = ExistentialDeposit;
 	type AccountStore = System;
@@ -101,12 +109,10 @@ impl pallet_balances::Config for Test {
 }
 
 impl crate::initializer::Config for Test {
-	type Randomness = TestRandomness<Self>;
+	type Randomness = TestRandomness;
 }
 
 impl crate::configuration::Config for Test { }
-
-impl crate::shared::Config for Test { }
 
 impl crate::paras::Config for Test {
 	type Origin = Origin;
@@ -119,15 +125,14 @@ impl crate::ump::Config for Test {
 }
 
 impl crate::hrmp::Config for Test {
-	type Event = Event;
 	type Origin = Origin;
-	type Currency = pallet_balances::Pallet<Test>;
+	type Currency = pallet_balances::Module<Test>;
 }
 
 impl crate::scheduler::Config for Test { }
 
 impl crate::inclusion::Config for Test {
-	type Event = Event;
+	type Event = TestEvent;
 	type RewardValidators = TestRewardValidators;
 }
 
@@ -135,21 +140,9 @@ impl crate::inclusion_inherent::Config for Test { }
 
 impl crate::session_info::Config for Test { }
 
-thread_local! {
-	pub static DISCOVERY_AUTHORITIES: RefCell<Vec<AuthorityDiscoveryId>> = RefCell::new(Vec::new());
-}
-
-pub fn discovery_authorities() -> Vec<AuthorityDiscoveryId> {
-	DISCOVERY_AUTHORITIES.with(|r| r.borrow().clone())
-}
-
-pub fn set_discovery_authorities(new: Vec<AuthorityDiscoveryId>) {
-	DISCOVERY_AUTHORITIES.with(|r| *r.borrow_mut() = new);
-}
-
 impl crate::session_info::AuthorityDiscoveryConfig for Test {
 	fn authorities() -> Vec<AuthorityDiscoveryId> {
-		discovery_authorities()
+		Vec::new()
 	}
 }
 
@@ -190,8 +183,37 @@ impl inclusion::RewardValidators for TestRewardValidators {
 	}
 }
 
+pub type System = frame_system::Module<Test>;
+
+/// Mocked initializer.
+pub type Initializer = crate::initializer::Module<Test>;
+
+/// Mocked configuration.
+pub type Configuration = crate::configuration::Module<Test>;
+
+/// Mocked paras.
+pub type Paras = crate::paras::Module<Test>;
+
+/// Mocked DMP
+pub type Dmp = crate::dmp::Module<Test>;
+
+/// Mocked UMP
+pub type Ump = crate::ump::Module<Test>;
+
+/// Mocked HRMP
+pub type Hrmp = crate::hrmp::Module<Test>;
+
+/// Mocked scheduler.
+pub type Scheduler = crate::scheduler::Module<Test>;
+
+/// Mocked inclusion module.
+pub type Inclusion = crate::inclusion::Module<Test>;
+
+/// Mocked session info module.
+pub type SessionInfo = crate::session_info::Module<Test>;
+
 /// Create a new set of test externalities.
-pub fn new_test_ext(state: MockGenesisConfig) -> TestExternalities {
+pub fn new_test_ext(state: GenesisConfig) -> TestExternalities {
 	BACKING_REWARDS.with(|r| r.borrow_mut().clear());
 	AVAILABILITY_REWARDS.with(|r| r.borrow_mut().clear());
 
@@ -203,7 +225,7 @@ pub fn new_test_ext(state: MockGenesisConfig) -> TestExternalities {
 }
 
 #[derive(Default)]
-pub struct MockGenesisConfig {
+pub struct GenesisConfig {
 	pub system: frame_system::GenesisConfig,
 	pub configuration: crate::configuration::GenesisConfig<Test>,
 	pub paras: crate::paras::GenesisConfig<Test>,

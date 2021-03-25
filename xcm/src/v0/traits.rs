@@ -36,8 +36,6 @@ pub enum Error {
 	MultiLocationFull,
 	FailedToDecode,
 	BadOrigin,
-	ExceedsMaxMessageSize,
-	FailedToTransactAsset(#[codec(skip)] &'static str),
 }
 
 impl From<()> for Error {

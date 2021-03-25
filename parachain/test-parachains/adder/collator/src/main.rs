@@ -63,7 +63,6 @@ fn main() -> Result<()> {
 							polkadot_service::IsCollator::Yes(collator.collator_id()),
 							None,
 							None,
-							None,
 						).map_err(|e| e.to_string())?;
 						let mut overseer_handler = full_node
 							.overseer_handler
@@ -82,7 +81,7 @@ fn main() -> Result<()> {
 
 						let config = CollationGenerationConfig {
 							key: collator.collator_key(),
-							collator: collator.create_collation_function(full_node.task_manager.spawn_handle()),
+							collator: collator.create_collation_function(),
 							para_id,
 						};
 						overseer_handler

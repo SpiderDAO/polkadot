@@ -21,7 +21,6 @@
 #![recursion_limit="256"]
 
 use std::time::Duration;
-
 use futures::{channel::oneshot, FutureExt, TryFutureExt};
 use thiserror::Error;
 
@@ -33,7 +32,7 @@ use polkadot_subsystem::{
 	},
 };
 use polkadot_node_network_protocol::{
-	PeerId, UnifiedReputationChange as Rep,
+	PeerId, ReputationChange as Rep,
 };
 use polkadot_primitives::v1::CollatorId;
 use polkadot_node_subsystem_util::{
@@ -44,7 +43,8 @@ use polkadot_node_subsystem_util::{
 mod collator_side;
 mod validator_side;
 
-const LOG_TARGET: &'static str = "parachain::collator-protocol";
+const LOG_TARGET: &'static str = "collator_protocol";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 enum Error {
@@ -62,20 +62,10 @@ enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-/// A collator eviction policy - how fast to evict collators which are inactive.
-#[derive(Debug, Clone, Copy)]
-pub struct CollatorEvictionPolicy(pub Duration);
-
-impl Default for CollatorEvictionPolicy {
-	fn default() -> Self {
-		CollatorEvictionPolicy(Duration::from_secs(24))
-	}
-}
-
 /// What side of the collator protocol is being engaged
 pub enum ProtocolSide {
 	/// Validators operate on the relay chain.
-	Validator(CollatorEvictionPolicy, validator_side::Metrics),
+	Validator(validator_side::Metrics),
 	/// Collators operate on a parachain.
 	Collator(CollatorId, collator_side::Metrics),
 }
@@ -102,9 +92,9 @@ impl CollatorProtocolSubsystem {
 		Context: SubsystemContext<Message = CollatorProtocolMessage>,
 	{
 		match self.protocol_side {
-			ProtocolSide::Validator(policy, metrics) => validator_side::run(
+			ProtocolSide::Validator(metrics) => validator_side::run(
 				ctx,
-				policy,
+				REQUEST_TIMEOUT,
 				metrics,
 			).await,
 			ProtocolSide::Collator(id, metrics) => collator_side::run(
@@ -139,7 +129,7 @@ where
 #[tracing::instrument(level = "trace", skip(ctx), fields(subsystem = LOG_TARGET))]
 async fn modify_reputation<Context>(ctx: &mut Context, peer: PeerId, rep: Rep)
 where
-	Context: SubsystemContext,
+	Context: SubsystemContext<Message = CollatorProtocolMessage>,
 {
 	tracing::trace!(
 		target: LOG_TARGET,

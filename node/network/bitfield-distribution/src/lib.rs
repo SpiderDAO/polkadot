@@ -27,22 +27,28 @@ use futures::{channel::oneshot, FutureExt};
 
 use polkadot_subsystem::messages::*;
 use polkadot_subsystem::{
-	PerLeafSpan, ActiveLeavesUpdate, FromOverseer, OverseerSignal, SpawnedSubsystem, Subsystem,
-	SubsystemContext, SubsystemResult,
-	jaeger,
+	PerLeafSpan, ActiveLeavesUpdate, FromOverseer, OverseerSignal, SpawnedSubsystem, Subsystem, SubsystemContext,
+	SubsystemResult,
 };
 use polkadot_node_subsystem_util::metrics::{self, prometheus};
 use polkadot_primitives::v1::{Hash, SignedAvailabilityBitfield, SigningContext, ValidatorId};
-use polkadot_node_network_protocol::{v1 as protocol_v1, PeerId, View, UnifiedReputationChange as Rep, OurView};
+use polkadot_node_network_protocol::{v1 as protocol_v1, PeerId, NetworkBridgeEvent, View, ReputationChange, OurView};
 use std::collections::{HashMap, HashSet};
 
-const COST_SIGNATURE_INVALID: Rep = Rep::CostMajor("Bitfield signature invalid");
-const COST_VALIDATOR_INDEX_INVALID: Rep = Rep::CostMajor("Bitfield validator index invalid");
-const COST_MISSING_PEER_SESSION_KEY: Rep = Rep::CostMinor("Missing peer session key");
-const COST_NOT_IN_VIEW: Rep = Rep::CostMinor("Not interested in that parent hash");
-const COST_PEER_DUPLICATE_MESSAGE: Rep = Rep::CostMinorRepeated("Peer sent the same message multiple times");
-const BENEFIT_VALID_MESSAGE_FIRST: Rep = Rep::BenefitMinorFirst("Valid message with new information");
-const BENEFIT_VALID_MESSAGE: Rep = Rep::BenefitMinor("Valid message");
+const COST_SIGNATURE_INVALID: ReputationChange =
+	ReputationChange::new(-100, "Bitfield signature invalid");
+const COST_VALIDATOR_INDEX_INVALID: ReputationChange =
+	ReputationChange::new(-100, "Bitfield validator index invalid");
+const COST_MISSING_PEER_SESSION_KEY: ReputationChange =
+	ReputationChange::new(-133, "Missing peer session key");
+const COST_NOT_IN_VIEW: ReputationChange =
+	ReputationChange::new(-51, "Not interested in that parent hash");
+const COST_PEER_DUPLICATE_MESSAGE: ReputationChange =
+	ReputationChange::new(-500, "Peer sent the same message multiple times");
+const BENEFIT_VALID_MESSAGE_FIRST: ReputationChange =
+	ReputationChange::new(15, "Valid message with new information");
+const BENEFIT_VALID_MESSAGE: ReputationChange =
+	ReputationChange::new(10, "Valid message");
 
 /// Checked signed availability bitfield that is distributed
 /// to other peers.
@@ -136,7 +142,7 @@ impl PerRelayParentData {
 	}
 }
 
-const LOG_TARGET: &str = "parachain::bitfield-distribution";
+const LOG_TARGET: &str = "bitfield_distribution";
 
 /// The bitfield distribution subsystem.
 pub struct BitfieldDistribution {
@@ -169,11 +175,7 @@ impl BitfieldDistribution {
 				FromOverseer::Communication {
 					msg: BitfieldDistributionMessage::DistributeBitfield(hash, signed_availability),
 				} => {
-					tracing::trace!(
-						target: LOG_TARGET,
-						?hash,
-						"Processing DistributeBitfield"
-					);
+					tracing::trace!(target: LOG_TARGET, "Processing DistributeBitfield");
 					handle_bitfield_distribution(
 						&mut ctx,
 						&mut state,
@@ -234,12 +236,12 @@ impl BitfieldDistribution {
 async fn modify_reputation<Context>(
 	ctx: &mut Context,
 	peer: PeerId,
-	rep: Rep,
+	rep: ReputationChange,
 )
 where
 	Context: SubsystemContext<Message = BitfieldDistributionMessage>,
 {
-	tracing::trace!(target: LOG_TARGET, ?rep, peer_id = %peer, "reputation change");
+	tracing::trace!(target: LOG_TARGET, rep = ?rep, peer_id = %peer, "reputation change");
 
 	ctx.send_message(AllMessages::NetworkBridge(
 		NetworkBridgeMessage::ReportPeer(peer, rep),
@@ -282,7 +284,7 @@ where
 		return;
 	}
 
-	let validator_index = signed_availability.validator_index().0 as usize;
+	let validator_index = signed_availability.validator_index() as usize;
 	let validator = if let Some(validator) = validator_set.get(validator_index) {
 		validator.clone()
 	} else {
@@ -403,18 +405,21 @@ where
 		return;
 	};
 
-	let mut _span = job_data.span
-			.child("msg-received")
-			.with_peer_id(&origin)
-			.with_claimed_validator_index(message.signed_availability.validator_index())
-			.with_stage(jaeger::Stage::BitfieldDistribution);
+	let mut _span = {
+		let mut span = job_data.span.child("msg-received");
+		span.add_string_tag("peer-id", &origin.to_base58());
+		span.add_string_tag(
+			"claimed-validator",
+			&message.signed_availability.validator_index().to_string(),
+		);
+		span
+	};
 
 	let validator_set = &job_data.validator_set;
 	if validator_set.is_empty() {
 		tracing::trace!(
 			target: LOG_TARGET,
 			relay_parent = %message.relay_parent,
-			?origin,
 			"Validator set is empty",
 		);
 		modify_reputation(ctx, origin, COST_MISSING_PEER_SESSION_KEY).await;
@@ -424,7 +429,7 @@ where
 	// Use the (untrusted) validator index provided by the signed payload
 	// and see if that one actually signed the availability bitset.
 	let signing_context = job_data.signing_context.clone();
-	let validator_index = message.signed_availability.validator_index().0 as usize;
+	let validator_index = message.signed_availability.validator_index() as usize;
 	let validator = if let Some(validator) = validator_set.get(validator_index) {
 		validator.clone()
 	} else {
@@ -443,12 +448,6 @@ where
 	if !received_set.contains(&validator) {
 		received_set.insert(validator.clone());
 	} else {
-		tracing::trace!(
-			target: LOG_TARGET,
-			validator_index,
-			?origin,
-			"Duplicate message",
-		);
 		modify_reputation(ctx, origin, COST_PEER_DUPLICATE_MESSAGE).await;
 		return;
 	};
@@ -496,51 +495,24 @@ where
 	let _timer = metrics.time_handle_network_msg();
 
 	match bridge_message {
-		NetworkBridgeEvent::PeerConnected(peerid, role) => {
-			tracing::trace!(
-				target: LOG_TARGET,
-				?peerid,
-				?role,
-				"Peer connected",
-			);
+		NetworkBridgeEvent::PeerConnected(peerid, _role) => {
 			// insert if none already present
 			state.peer_views.entry(peerid).or_default();
 		}
 		NetworkBridgeEvent::PeerDisconnected(peerid) => {
-			tracing::trace!(
-				target: LOG_TARGET,
-				?peerid,
-				"Peer disconnected",
-			);
 			// get rid of superfluous data
 			state.peer_views.remove(&peerid);
 		}
 		NetworkBridgeEvent::PeerViewChange(peerid, view) => {
-			tracing::trace!(
-				target: LOG_TARGET,
-				?peerid,
-				?view,
-				"Peer view change",
-			);
 			handle_peer_view_change(ctx, state, peerid, view).await;
 		}
 		NetworkBridgeEvent::OurViewChange(view) => {
-			tracing::trace!(
-				target: LOG_TARGET,
-				?view,
-				"Our view change",
-			);
 			handle_our_view_change(state, view);
 		}
 		NetworkBridgeEvent::PeerMessage(remote, message) => {
 			match message {
 				protocol_v1::BitfieldDistributionMessage::Bitfield(relay_parent, bitfield) => {
-					tracing::trace!(
-						target: LOG_TARGET,
-						peer_id = %remote,
-						?relay_parent,
-						"received bitfield gossip from peer"
-					);
+					tracing::trace!(target: LOG_TARGET, peer_id = %remote, "received bitfield gossip from peer");
 					let gossiped_bitfield = BitfieldGossipMessage {
 						relay_parent,
 						signed_availability: bitfield,
@@ -639,13 +611,6 @@ where
 	};
 
 	let _span = job_data.span.child("gossip");
-	tracing::trace!(
-		target: LOG_TARGET,
-		?dest,
-		?validator,
-		relay_parent = ?message.relay_parent,
-		"Sending gossip message"
-	);
 
 	job_data.message_sent_to_peer
 		.entry(dest.clone())
@@ -811,7 +776,7 @@ mod test {
 	use bitvec::bitvec;
 	use futures::executor;
 	use maplit::hashmap;
-	use polkadot_primitives::v1::{Signed, AvailabilityBitfield, ValidatorIndex};
+	use polkadot_primitives::v1::{Signed, AvailabilityBitfield};
 	use polkadot_node_subsystem_test_helpers::make_subsystem_context;
 	use polkadot_node_subsystem_util::TimeoutExt;
 	use sp_keystore::{SyncCryptoStorePtr, SyncCryptoStore};
@@ -821,7 +786,7 @@ mod test {
 	use std::time::Duration;
 	use assert_matches::assert_matches;
 	use polkadot_node_network_protocol::{view, ObservedRole, our_view};
-	use polkadot_subsystem::jaeger;
+	use polkadot_subsystem::JaegerSpan;
 
 	macro_rules! launch {
 		($fut:expr) => {
@@ -853,7 +818,7 @@ mod test {
 						},
 						message_received_from_peer: hashmap!{},
 						message_sent_to_peer: hashmap!{},
-						span: PerLeafSpan::new(Arc::new(jaeger::Span::Disabled), "test"),
+						span: PerLeafSpan::new(Arc::new(JaegerSpan::Disabled), "test"),
 					},
 			},
 			peer_views: peers
@@ -879,7 +844,7 @@ mod test {
 		let validator = SyncCryptoStore::sr25519_generate_new(&*keystore, ValidatorId::ID, None)
 			.expect("generating sr25519 key not to fail");
 
-		state.per_relay_parent = view.iter().map(|relay_parent| {(
+		state.per_relay_parent = view.heads.iter().map(|relay_parent| {(
 				relay_parent.clone(),
 				PerRelayParentData {
 					signing_context: signing_context.clone(),
@@ -887,7 +852,7 @@ mod test {
 					one_per_validator: hashmap!{},
 					message_received_from_peer: hashmap!{},
 					message_sent_to_peer: hashmap!{},
-					span: PerLeafSpan::new(Arc::new(jaeger::Span::Disabled), "test"),
+					span: PerLeafSpan::new(Arc::new(JaegerSpan::Disabled), "test"),
 				})
 			}).collect();
 
@@ -926,9 +891,9 @@ mod test {
 			&keystore,
 			payload,
 			&signing_context,
-			ValidatorIndex(0),
+			0,
 			&malicious.into(),
-		)).ok().flatten().expect("should be signed");
+		)).expect("should be signed");
 
 		let msg = BitfieldGossipMessage {
 			relay_parent: hash_a.clone(),
@@ -991,9 +956,9 @@ mod test {
 			&keystore,
 			payload,
 			&signing_context,
-			ValidatorIndex(42),
+			42,
 			&validator,
-		)).ok().flatten().expect("should be signed");
+		)).expect("should be signed");
 
 		let msg = BitfieldGossipMessage {
 			relay_parent: hash_a.clone(),
@@ -1048,9 +1013,9 @@ mod test {
 			&keystore,
 			payload,
 			&signing_context,
-			ValidatorIndex(0),
+			0,
 			&validator,
-		)).ok().flatten().expect("should be signed");
+		)).expect("should be signed");
 
 		let msg = BitfieldGossipMessage {
 			relay_parent: hash_a.clone(),
@@ -1163,9 +1128,9 @@ mod test {
 			&keystore,
 			payload,
 			&signing_context,
-			ValidatorIndex(0),
+			0,
 			&validator,
-		)).ok().flatten().expect("should be signed");
+		)).expect("should be signed");
 
 		state.peer_views.insert(peer_b.clone(), view![hash]);
 		state.peer_views.insert(peer_a.clone(), view![hash]);
@@ -1259,9 +1224,9 @@ mod test {
 			&keystore,
 			payload,
 			&signing_context,
-			ValidatorIndex(0),
+			0,
 			&validator,
-		)).ok().flatten().expect("should be signed");
+		)).expect("should be signed");
 
 		let msg = BitfieldGossipMessage {
 			relay_parent: hash_a.clone(),
@@ -1418,9 +1383,9 @@ mod test {
 			&keystore,
 			payload,
 			&signing_context,
-			ValidatorIndex(0),
+			0,
 			&validator,
-		)).ok().flatten().expect("should be signed");
+		)).expect("should be signed");
 
 		state.peer_views.insert(peer_b.clone(), view![hash]);
 		state.peer_views.insert(peer_a.clone(), view![hash]);

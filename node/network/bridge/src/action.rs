@@ -19,17 +19,16 @@ use futures::channel::mpsc;
 
 use parity_scale_codec::Decode;
 use polkadot_node_network_protocol::{
-	peer_set::PeerSet, v1 as protocol_v1, PeerId, UnifiedReputationChange,
+	peer_set::PeerSet, v1 as protocol_v1, PeerId, ReputationChange,
 };
 use polkadot_primitives::v1::{AuthorityDiscoveryId, BlockNumber};
-use polkadot_subsystem::messages::{AllMessages, NetworkBridgeMessage};
+use polkadot_subsystem::messages::NetworkBridgeMessage;
 use polkadot_subsystem::{ActiveLeavesUpdate, FromOverseer, OverseerSignal};
-use sc_network::{Event as NetworkEvent, IfDisconnected};
+use sc_network::Event as NetworkEvent;
 
-use polkadot_node_network_protocol::{request_response::Requests, ObservedRole};
+use polkadot_node_network_protocol::ObservedRole;
 
-use super::multiplexer::RequestMultiplexError;
-use super::{WireMessage, MALFORMED_MESSAGE_COST};
+use super::{WireMessage, LOG_TARGET, MALFORMED_MESSAGE_COST};
 
 /// Internal type combining all actions a `NetworkBridge` might perform.
 ///
@@ -44,21 +43,14 @@ pub(crate) enum Action {
 	/// Ask network to send a collation message.
 	SendCollationMessages(Vec<(Vec<PeerId>, protocol_v1::CollationProtocol)>),
 
-	/// Ask network to send requests.
-	SendRequests(Vec<Requests>, IfDisconnected),
-
 	/// Ask network to connect to validators.
 	ConnectToValidators {
 		validator_ids: Vec<AuthorityDiscoveryId>,
-		peer_set: PeerSet,
 		connected: mpsc::Sender<(AuthorityDiscoveryId, PeerId)>,
 	},
 
 	/// Report a peer to the network implementation (decreasing/increasing its reputation).
-	ReportPeer(PeerId, UnifiedReputationChange),
-
-	/// Disconnect a peer from the given peer-set without affecting their reputation.
-	DisconnectPeer(PeerId, PeerSet),
+	ReportPeer(PeerId, ReputationChange),
 
 	/// A subsystem updates us on the relay chain leaves we consider active.
 	///
@@ -84,32 +76,13 @@ pub(crate) enum Action {
 		Vec<WireMessage<protocol_v1::CollationProtocol>>,
 	),
 
-	/// Send a message to another subsystem or the overseer.
-	///
-	/// Used for handling incoming requests.
-	SendMessage(AllMessages),
-
-	/// Abort with reason.
-	Abort(AbortReason),
+	Abort,
 	Nop,
 }
 
-#[derive(Debug)]
-pub(crate) enum AbortReason {
-	/// Received error from overseer:
-	SubsystemError(polkadot_subsystem::SubsystemError),
-	/// The stream of incoming events concluded.
-	EventStreamConcluded,
-	/// The stream of incoming requests concluded.
-	RequestStreamConcluded,
-	/// We received OverseerSignal::Conclude
-	OverseerConcluded,
-}
-
 impl From<polkadot_subsystem::SubsystemResult<FromOverseer<NetworkBridgeMessage>>> for Action {
-	fn from(
-		res: polkadot_subsystem::SubsystemResult<FromOverseer<NetworkBridgeMessage>>,
-	) -> Self {
+	#[tracing::instrument(level = "trace", fields(subsystem = LOG_TARGET))]
+	fn from(res: polkadot_subsystem::SubsystemResult<FromOverseer<NetworkBridgeMessage>>) -> Self {
 		match res {
 			Ok(FromOverseer::Signal(OverseerSignal::ActiveLeaves(active_leaves))) => {
 				Action::ActiveLeaves(active_leaves)
@@ -117,21 +90,15 @@ impl From<polkadot_subsystem::SubsystemResult<FromOverseer<NetworkBridgeMessage>
 			Ok(FromOverseer::Signal(OverseerSignal::BlockFinalized(_hash, number))) => {
 				Action::BlockFinalized(number)
 			}
-			Ok(FromOverseer::Signal(OverseerSignal::Conclude)) => {
-				Action::Abort(AbortReason::OverseerConcluded)
-			}
+			Ok(FromOverseer::Signal(OverseerSignal::Conclude)) => Action::Abort,
 			Ok(FromOverseer::Communication { msg }) => match msg {
 				NetworkBridgeMessage::ReportPeer(peer, rep) => Action::ReportPeer(peer, rep),
-				NetworkBridgeMessage::DisconnectPeer(peer, peer_set) => {
-					Action::DisconnectPeer(peer, peer_set)
-				}
 				NetworkBridgeMessage::SendValidationMessage(peers, msg) => {
 					Action::SendValidationMessages(vec![(peers, msg)])
 				}
 				NetworkBridgeMessage::SendCollationMessage(peers, msg) => {
 					Action::SendCollationMessages(vec![(peers, msg)])
 				}
-				NetworkBridgeMessage::SendRequests(reqs, if_disconnected) => Action::SendRequests(reqs, if_disconnected),
 				NetworkBridgeMessage::SendValidationMessages(msgs) => {
 					Action::SendValidationMessages(msgs)
 				}
@@ -140,23 +107,31 @@ impl From<polkadot_subsystem::SubsystemResult<FromOverseer<NetworkBridgeMessage>
 				}
 				NetworkBridgeMessage::ConnectToValidators {
 					validator_ids,
-					peer_set,
 					connected,
 				} => Action::ConnectToValidators {
 					validator_ids,
-					peer_set,
 					connected,
 				},
 			},
-			Err(e) => Action::Abort(AbortReason::SubsystemError(e)),
+			Err(e) => {
+				tracing::warn!(target: LOG_TARGET, err = ?e, "Shutting down Network Bridge due to error");
+				Action::Abort
+			}
 		}
 	}
 }
 
 impl From<Option<NetworkEvent>> for Action {
+	#[tracing::instrument(level = "trace", fields(subsystem = LOG_TARGET))]
 	fn from(event: Option<NetworkEvent>) -> Action {
 		match event {
-			None => Action::Abort(AbortReason::EventStreamConcluded),
+			None => {
+				tracing::info!(
+					target: LOG_TARGET,
+					"Shutting down Network Bridge: underlying event stream concluded"
+				);
+				Action::Abort
+			}
 			Some(NetworkEvent::Dht(_))
 			| Some(NetworkEvent::SyncConnected { .. })
 			| Some(NetworkEvent::SyncDisconnected { .. }) => Action::Nop,
@@ -178,9 +153,7 @@ impl From<Option<NetworkEvent>> for Action {
 			Some(NetworkEvent::NotificationsReceived { remote, messages }) => {
 				let v_messages: Result<Vec<_>, _> = messages
 					.iter()
-					.filter(|(protocol, _)| {
-						protocol == &PeerSet::Validation.into_protocol_name()
-					})
+					.filter(|(protocol, _)| protocol == &PeerSet::Validation.into_protocol_name())
 					.map(|(_, msg_bytes)| WireMessage::decode(&mut msg_bytes.as_ref()))
 					.collect();
 
@@ -191,9 +164,7 @@ impl From<Option<NetworkEvent>> for Action {
 
 				let c_messages: Result<Vec<_>, _> = messages
 					.iter()
-					.filter(|(protocol, _)| {
-						protocol == &PeerSet::Collation.into_protocol_name()
-					})
+					.filter(|(protocol, _)| protocol == &PeerSet::Collation.into_protocol_name())
 					.map(|(_, msg_bytes)| WireMessage::decode(&mut msg_bytes.as_ref()))
 					.collect();
 
@@ -208,16 +179,6 @@ impl From<Option<NetworkEvent>> for Action {
 					}
 				}
 			}
-		}
-	}
-}
-
-impl From<Option<Result<AllMessages, RequestMultiplexError>>> for Action {
-	fn from(event: Option<Result<AllMessages, RequestMultiplexError>>) -> Self {
-		match event {
-			None => Action::Abort(AbortReason::RequestStreamConcluded),
-			Some(Err(err)) => Action::ReportPeer(err.peer, MALFORMED_MESSAGE_COST),
-			Some(Ok(msg)) => Action::SendMessage(msg),
 		}
 	}
 }

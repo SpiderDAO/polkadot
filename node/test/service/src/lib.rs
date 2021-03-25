@@ -83,7 +83,6 @@ pub fn new_full(
 		None,
 		None,
 		polkadot_parachain::wasm_executor::IsolationStrategy::InProcess,
-		None,
 	)
 }
 
@@ -113,7 +112,7 @@ pub fn node_config(
 	let base_path = BasePath::new_temp_dir().expect("could not create temporary directory");
 	let root = base_path.path();
 	let role = if is_validator {
-		Role::Authority
+		Role::Authority { sentry_nodes: Vec::new() }
 	} else {
 		Role::Full
 	};
@@ -199,6 +198,7 @@ pub fn node_config(
 		base_path: Some(base_path),
 		informant_output_format: Default::default(),
 		disable_log_reloading: false,
+		telemetry_handle: None,
 	}
 }
 

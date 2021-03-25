@@ -19,7 +19,7 @@
 //! Configuration can change only at session boundaries and is buffered until then.
 
 use sp_std::prelude::*;
-use primitives::v1::{Balance, SessionIndex};
+use primitives::v1::{Balance, ValidatorId, SessionIndex};
 use frame_support::{
 	decl_storage, decl_module, decl_error,
 	ensure,
@@ -29,7 +29,6 @@ use frame_support::{
 use parity_scale_codec::{Encode, Decode};
 use frame_system::ensure_root;
 use sp_runtime::traits::Zero;
-use crate::shared;
 
 /// All configuration of the runtime with respect to parachains and parathreads.
 #[derive(Clone, Encode, Decode, PartialEq, sp_core::RuntimeDebug)]
@@ -146,10 +145,6 @@ pub struct HostConfiguration<BlockNumber> {
 	///
 	/// `None` means no maximum.
 	pub max_validators_per_core: Option<u32>,
-	/// The maximum number of valdiators to use for parachain consensus, period.
-	///
-	/// `None` means no maximum.
-	pub max_validators: Option<u32>,
 	/// The amount of sessions to keep for disputes.
 	pub dispute_period: SessionIndex,
 	/// The amount of consensus slots that must pass between submitting an assignment and
@@ -185,7 +180,6 @@ impl<BlockNumber: Default + From<u32>> Default for HostConfiguration<BlockNumber
 			parathread_retries: Default::default(),
 			scheduling_lookahead: Default::default(),
 			max_validators_per_core: Default::default(),
-			max_validators: None,
 			dispute_period: Default::default(),
 			n_delay_tranches: Default::default(),
 			zeroth_delay_tranche_width: Default::default(),
@@ -237,14 +231,14 @@ impl<BlockNumber: Zero> HostConfiguration<BlockNumber> {
 	}
 }
 
-pub trait Config: frame_system::Config + shared::Config { }
+pub trait Config: frame_system::Config { }
 
 decl_storage! {
 	trait Store for Module<T: Config> as Configuration {
 		/// The active configuration for the current session.
 		ActiveConfig get(fn config) config(): HostConfiguration<T::BlockNumber>;
 		/// Pending configuration (if any) for the next session.
-		PendingConfig: map hasher(twox_64_concat) SessionIndex => Option<HostConfiguration<T::BlockNumber>>;
+		PendingConfig: Option<HostConfiguration<T::BlockNumber>>;
 	}
 	add_extra_genesis {
 		build(|config: &Self| {
@@ -401,16 +395,6 @@ decl_module! {
 			ensure_root(origin)?;
 			Self::update_config_member(|config| {
 				sp_std::mem::replace(&mut config.max_validators_per_core, new) != new
-			});
-			Ok(())
-		}
-
-		/// Set the maximum number of validators to use in parachain consensus.
-		#[weight = (1_000, DispatchClass::Operational)]
-		pub fn set_max_validators(origin, new: Option<u32>) -> DispatchResult {
-			ensure_root(origin)?;
-			Self::update_config_member(|config| {
-				sp_std::mem::replace(&mut config.max_validators, new) != new
 			});
 			Ok(())
 		}
@@ -662,17 +646,10 @@ impl<T: Config> Module<T> {
 	pub(crate) fn initializer_finalize() { }
 
 	/// Called by the initializer to note that a new session has started.
-	pub(crate) fn initializer_on_new_session(
-		session_index: &SessionIndex,
-	) {
-		if let Some(pending) = <Self as Store>::PendingConfig::take(session_index) {
+	pub(crate) fn initializer_on_new_session(_validators: &[ValidatorId], _queued: &[ValidatorId]) {
+		if let Some(pending) = <Self as Store>::PendingConfig::take() {
 			<Self as Store>::ActiveConfig::set(pending);
 		}
-	}
-
-	/// Return the session index that should be used for any future scheduled changes.
-	fn scheduled_session() -> SessionIndex {
-		shared::Module::<T>::scheduled_session()
 	}
 
 	// NOTE: Explicitly tell rustc not to inline this because otherwise heuristics note the incoming
@@ -683,12 +660,11 @@ impl<T: Config> Module<T> {
 	fn update_config_member(
 		updater: impl FnOnce(&mut HostConfiguration<T::BlockNumber>) -> bool,
 	) {
-		let scheduled_session = Self::scheduled_session();
-		let pending = <Self as Store>::PendingConfig::get(scheduled_session);
+		let pending = <Self as Store>::PendingConfig::get();
 		let mut prev = pending.unwrap_or_else(Self::config);
 
 		if updater(&mut prev) {
-			<Self as Store>::PendingConfig::insert(scheduled_session, prev);
+			<Self as Store>::PendingConfig::set(Some(prev));
 		}
 	}
 }
@@ -696,32 +672,32 @@ impl<T: Config> Module<T> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::mock::{new_test_ext, Configuration, Origin};
+	use crate::mock::{new_test_ext, Initializer, Configuration, Origin};
 
-	use frame_support::assert_ok;
+	use frame_support::traits::{OnFinalize, OnInitialize};
 
 	#[test]
-	fn config_changes_after_2_session_boundary() {
+	fn config_changes_on_session_boundary() {
 		new_test_ext(Default::default()).execute_with(|| {
 			let old_config = Configuration::config();
 			let mut config = old_config.clone();
 			config.validation_upgrade_delay = 100;
+
 			assert!(old_config != config);
 
-			assert_ok!(Configuration::set_validation_upgrade_delay(Origin::root(), 100));
+			<Configuration as Store>::PendingConfig::set(Some(config.clone()));
+
+			Initializer::on_initialize(1);
 
 			assert_eq!(Configuration::config(), old_config);
-			assert_eq!(<Configuration as Store>::PendingConfig::get(1), None);
+			assert_eq!(<Configuration as Store>::PendingConfig::get(), Some(config.clone()));
 
-			Configuration::initializer_on_new_session(&1);
+			Initializer::on_finalize(1);
 
-			assert_eq!(Configuration::config(), old_config);
-			assert_eq!(<Configuration as Store>::PendingConfig::get(2), Some(config.clone()));
-
-			Configuration::initializer_on_new_session(&2);
+			Configuration::initializer_on_new_session(&[], &[]);
 
 			assert_eq!(Configuration::config(), config);
-			assert_eq!(<Configuration as Store>::PendingConfig::get(3), None);
+			assert!(<Configuration as Store>::PendingConfig::get().is_none());
 		})
 	}
 
@@ -742,7 +718,6 @@ mod tests {
 				thread_availability_period: 8,
 				scheduling_lookahead: 3,
 				max_validators_per_core: None,
-				max_validators: None,
 				dispute_period: 239,
 				no_show_slots: 240,
 				n_delay_tranches: 241,
@@ -768,7 +743,7 @@ mod tests {
 				hrmp_max_message_num_per_candidate: 20,
 			};
 
-			assert!(<Configuration as Store>::PendingConfig::get(shared::SESSION_DELAY).is_none());
+			assert!(<Configuration as Store>::PendingConfig::get().is_none());
 
 			Configuration::set_validation_upgrade_frequency(
 				Origin::root(), new_config.validation_upgrade_frequency,
@@ -808,9 +783,6 @@ mod tests {
 			).unwrap();
 			Configuration::set_max_validators_per_core(
 				Origin::root(), new_config.max_validators_per_core,
-			).unwrap();
-			Configuration::set_max_validators(
-				Origin::root(), new_config.max_validators,
 			).unwrap();
 			Configuration::set_dispute_period(
 				Origin::root(), new_config.dispute_period,
@@ -893,7 +865,7 @@ mod tests {
 				new_config.hrmp_max_message_num_per_candidate,
 			).unwrap();
 
-			assert_eq!(<Configuration as Store>::PendingConfig::get(shared::SESSION_DELAY), Some(new_config));
+			assert_eq!(<Configuration as Store>::PendingConfig::get(), Some(new_config));
 		})
 	}
 
@@ -908,7 +880,7 @@ mod tests {
 	fn setting_config_to_same_as_current_is_noop() {
 		new_test_ext(Default::default()).execute_with(|| {
 			Configuration::set_validation_upgrade_delay(Origin::root(), Default::default()).unwrap();
-			assert!(<Configuration as Store>::PendingConfig::get(shared::SESSION_DELAY).is_none())
+			assert!(<Configuration as Store>::PendingConfig::get().is_none())
 		});
 	}
 

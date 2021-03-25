@@ -6,10 +6,11 @@ edition = "2018"
 
 [dependencies]
 futures = "0.3.12"
-tracing = "0.1.25"
+tracing = "0.1.22"
+tracing-futures = "0.2.4"
 
 sp-core = { package = "sp-core", git = "https://github.com/paritytech/substrate", branch = "rococo-v1" }
-parity-scale-codec = { version = "2.0.0", default-features = false, features = ["bit-vec", "derive"] }
+parity-scale-codec = { version = "1.3.6", default-features = false, features = ["bit-vec", "derive"] }
 
 polkadot-primitives = { path = "../../../primitives" }
 polkadot-parachain = { path = "../../../parachain" }

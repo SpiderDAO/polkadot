@@ -107,8 +107,6 @@ decl_event! {
 		ParachainRegistered(ParaId),
 		/// New validators were added to the set.
 		ValidatorsRegistered(Vec<ValidatorId>),
-		/// Validators were removed from the set.
-		ValidatorsDeregistered(Vec<ValidatorId>),
 	}
 }
 
@@ -136,8 +134,6 @@ decl_error! {
 		DefinitelyNotWasm,
 		/// Registration requires at least one validator.
 		AtLeastOneValidatorRequired,
-		/// Couldn't schedule parachain cleanup.
-		CouldntCleanup,
 	}
 }
 
@@ -199,7 +195,11 @@ decl_module! {
 			ensure!(validators.len() > 0, Error::<T>::AtLeastOneValidatorRequired);
 			ensure!(!Proposals::<T>::contains_key(&para_id), Error::<T>::ParachainIdAlreadyProposed);
 			ensure!(
-				runtime_parachains::paras::Module::<T>::lifecycle(para_id).is_none(),
+				!runtime_parachains::paras::Module::<T>::parachains().contains(&para_id),
+				Error::<T>::ParachainIdAlreadyTaken,
+			);
+			ensure!(
+				!runtime_parachains::paras::Module::<T>::upcoming_paras().contains(&para_id),
 				Error::<T>::ParachainIdAlreadyTaken,
 			);
 			ensure!(validation_code.0.starts_with(runtime_common::WASM_MAGIC), Error::<T>::DefinitelyNotWasm);
@@ -289,17 +289,15 @@ decl_module! {
 			if let Some(who) = who {
 				ensure!(who == info.proposer, Error::<T>::NotAuthorized);
 			}
-			runtime_parachains::schedule_para_cleanup::<T>(para_id).map_err(|_| Error::<T>::CouldntCleanup)?;
 
 			ParachainInfo::<T>::remove(&para_id);
 			info.validators.into_iter().for_each(|v| ValidatorsToRetire::<T>::append(v));
+			runtime_parachains::schedule_para_cleanup::<T>(para_id);
 
 			pallet_balances::Module::<T>::unreserve(&info.proposer, T::ProposeDeposit::get());
 		}
 
 		/// Add new validators to the set.
-		///
-		/// The new validators will be active from current session + 2.
 		#[weight = 100_000]
 		fn register_validators(
 			origin,
@@ -310,21 +308,6 @@ decl_module! {
 			validators.clone().into_iter().for_each(|v| ValidatorsToAdd::<T>::append(v));
 
 			Self::deposit_event(RawEvent::ValidatorsRegistered(validators));
-		}
-
-		/// Remove validators from the set.
-		///
-		/// The removed validators will be deactivated from current session + 2.
-		#[weight = 100_000]
-		fn deregister_validators(
-			origin,
-			validators: Vec<T::ValidatorId>,
-		) {
-			T::PriviledgedOrigin::ensure_origin(origin)?;
-
-			validators.clone().into_iter().for_each(|v| ValidatorsToRetire::<T>::append(v));
-
-			Self::deposit_event(RawEvent::ValidatorsDeregistered(validators));
 		}
 	}
 }
@@ -371,8 +354,7 @@ impl<T: Config> pallet_session::SessionManager<T::ValidatorId> for Module<T> {
 				parachain: true,
 			};
 
-			// Not much we can do if this fails...
-			let _ = runtime_parachains::schedule_para_initialize::<T>(*id, genesis);
+			runtime_parachains::schedule_para_initialize::<T>(*id, genesis);
 
 			validators.extend(proposal.validators);
 		}

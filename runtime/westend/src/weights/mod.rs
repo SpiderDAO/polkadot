@@ -17,7 +17,6 @@
 
 pub mod frame_system;
 pub mod pallet_balances;
-pub mod pallet_election_provider_multi_phase;
 pub mod pallet_identity;
 pub mod pallet_im_online;
 pub mod pallet_indices;

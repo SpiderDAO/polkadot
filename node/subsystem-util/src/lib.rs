@@ -29,7 +29,7 @@ use polkadot_node_subsystem::{
 	messages::{AllMessages, RuntimeApiMessage, RuntimeApiRequest, RuntimeApiSender, BoundToRelayParent},
 	FromOverseer, SpawnedSubsystem, Subsystem, SubsystemContext, SubsystemError, SubsystemResult,
 };
-use polkadot_node_jaeger as jaeger;
+use polkadot_node_jaeger::JaegerSpan;
 use futures::{channel::{mpsc, oneshot}, prelude::*, select, stream::Stream};
 use futures_timer::Delay;
 use parity_scale_codec::Encode;
@@ -321,7 +321,7 @@ impl Validator {
 			.iter()
 			.enumerate()
 			.find(|(_, k)| k == &&key)
-			.map(|(idx, _)| ValidatorIndex(idx as u32))
+			.map(|(idx, _)| idx as ValidatorIndex)
 			.expect("signing_key would have already returned NotAValidator if the item we're searching for isn't in this list; qed");
 
 		Ok(Validator {
@@ -351,7 +351,7 @@ impl Validator {
 		&self,
 		keystore: SyncCryptoStorePtr,
 		payload: Payload,
-	) -> Result<Option<Signed<Payload, RealPayload>>, KeystoreError> {
+	) -> Result<Signed<Payload, RealPayload>, KeystoreError> {
 		Signed::sign(&keystore, payload, &self.signing_context, self.index, &self.key).await
 	}
 
@@ -481,7 +481,7 @@ pub trait JobTrait: Unpin {
 	/// The job should be ended when `receiver` returns `None`.
 	fn run(
 		parent: Hash,
-		span: Arc<jaeger::Span>,
+		span: Arc<JaegerSpan>,
 		run_args: Self::RunArgs,
 		metrics: Self::Metrics,
 		receiver: mpsc::Receiver<Self::ToJob>,
@@ -552,7 +552,7 @@ impl<Spawner: SpawnNamed, Job: 'static + JobTrait> Jobs<Spawner, Job> {
 	fn spawn_job(
 		&mut self,
 		parent_hash: Hash,
-		span: Arc<jaeger::Span>,
+		span: Arc<JaegerSpan>,
 		run_args: Job::RunArgs,
 		metrics: Job::Metrics,
 	) -> Result<(), Error> {
@@ -1045,10 +1045,9 @@ mod tests {
 	use super::*;
 	use executor::block_on;
 	use thiserror::Error;
-	use polkadot_node_jaeger as jaeger;
 	use polkadot_node_subsystem::{
 		messages::{AllMessages, CandidateSelectionMessage}, ActiveLeavesUpdate, FromOverseer, OverseerSignal,
-		SpawnedSubsystem,
+		SpawnedSubsystem, JaegerSpan,
 	};
 	use assert_matches::assert_matches;
 	use futures::{channel::mpsc, executor, StreamExt, future, Future, FutureExt, SinkExt};
@@ -1090,7 +1089,7 @@ mod tests {
 		// this function is in charge of creating and executing the job's main loop
 		fn run(
 			_: Hash,
-			_: Arc<jaeger::Span>,
+			_: Arc<JaegerSpan>,
 			run_args: Self::RunArgs,
 			_metrics: Self::Metrics,
 			receiver: mpsc::Receiver<CandidateSelectionMessage>,
@@ -1174,7 +1173,7 @@ mod tests {
 		test_harness(true, |mut overseer_handle, err_rx| async move {
 			overseer_handle
 				.send(FromOverseer::Signal(OverseerSignal::ActiveLeaves(
-					ActiveLeavesUpdate::start_work(relay_parent, Arc::new(jaeger::Span::Disabled)),
+					ActiveLeavesUpdate::start_work(relay_parent, Arc::new(JaegerSpan::Disabled)),
 				)))
 				.await;
 			assert_matches!(
@@ -1203,7 +1202,7 @@ mod tests {
 		test_harness(true, |mut overseer_handle, err_rx| async move {
 			overseer_handle
 				.send(FromOverseer::Signal(OverseerSignal::ActiveLeaves(
-					ActiveLeavesUpdate::start_work(relay_parent, Arc::new(jaeger::Span::Disabled)),
+					ActiveLeavesUpdate::start_work(relay_parent, Arc::new(JaegerSpan::Disabled)),
 				)))
 				.await;
 

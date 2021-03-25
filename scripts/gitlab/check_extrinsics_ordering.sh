@@ -1,27 +1,16 @@
-#!/usr/bin/env bash
-set -e
+#!/bin/bash
+BIN=./target/release/polkadot
+LIVE_WS=wss://rpc.polkadot.io
+LOCAL_WS=ws://localhost:9944
 
-# Include the common functions library
-#shellcheck source=../common/lib.sh
-. "$(dirname "${0}")/../common/lib.sh"
-
-HEAD_BIN=./target/release/polkadot
-HEAD_WS=ws://localhost:9944
-RELEASE_WS=ws://localhost:9945
+# Kill the polkadot client before exiting
+trap 'kill "$(jobs -p)"' EXIT
 
 runtimes=(
   "westend"
   "kusama"
   "polkadot"
 )
-
-# First we fetch the latest released binary
-latest_release=$(latest_release 'paritytech/polkadot')
-RELEASE_BIN="./polkadot-$latest_release"
-echo "[+] Fetching binary for Polkadot version $latest_release"
-curl -L "https://github.com/paritytech/polkadot/releases/download/$latest_release/polkadot" > "$RELEASE_BIN" || exit 1
-chmod +x "$RELEASE_BIN"
-
 
 for RUNTIME in "${runtimes[@]}"; do
   echo "[+] Checking runtime: ${RUNTIME}"
@@ -43,29 +32,19 @@ for RUNTIME in "${runtimes[@]}"; do
     exit 0
   fi
 
-  # Start running the nodes in the background
-  $HEAD_BIN --chain="$RUNTIME-local" --tmp &
-  $RELEASE_BIN --chain="$RUNTIME-local" --ws-port 9945 --tmp &
+  if [ "$RUNTIME" = 'polkadot' ]; then
+    LIVE_WS="wss://rpc.polkadot.io"
+  else
+    LIVE_WS="wss://${RUNTIME}-rpc.polkadot.io"
+  fi
+
+  # Start running the local polkadot node in the background
+  $BIN --chain="$RUNTIME-local"  &
   jobs
 
-  # Sleep a little to allow the nodes to spin up and start listening
-  TIMEOUT=5
-  for i in $(seq $TIMEOUT); do
-    sleep 1
-      if [ "$(lsof -nP -iTCP -sTCP:LISTEN | grep -c '994[45]')" == 2 ]; then
-        echo "[+] Both nodes listening"
-        break
-      fi
-      if [ "$i" == $TIMEOUT ]; then
-        echo "[!] Both nodes not listening after $i seconds. Exiting"
-        exit 1
-      fi
-  done
-  sleep 5
-
   changed_extrinsics=$(
-    polkadot-js-metadata-cmp "$RELEASE_WS" "$HEAD_WS" \
-      | sed 's/^ \+//g' | grep -e 'idx: [0-9]\+ -> [0-9]\+' || true
+    polkadot-js-metadata-cmp "$LIVE_WS" "$LOCAL_WS" \
+      | sed 's/^ \+//g' | grep -e 'idx: [0-9]\+ -> [0-9]\+'
   )
 
   if [ -n "$changed_extrinsics" ]; then
@@ -75,8 +54,6 @@ for RUNTIME in "${runtimes[@]}"; do
   fi
 
   echo "[+] No change in extrinsics ordering for the ${RUNTIME} runtime"
-  jobs -p | xargs kill; sleep 5
+  kill "$(jobs -p)"; sleep 5
 done
 
-# Sleep a little to let the jobs die properly
-sleep 5

@@ -28,9 +28,9 @@ use sc_network::multiaddr::{Multiaddr, Protocol};
 use sc_authority_discovery::Service as AuthorityDiscoveryService;
 use polkadot_node_network_protocol::PeerId;
 use polkadot_primitives::v1::{AuthorityDiscoveryId, Block, Hash};
-use polkadot_node_network_protocol::peer_set::{PeerSet, PerPeerSet};
+use polkadot_node_network_protocol::peer_set::PeerSet;
 
-const LOG_TARGET: &str = "parachain::validator-discovery";
+const LOG_TARGET: &str = "validator_discovery";
 
 /// An abstraction over networking for the purposes of validator discovery service.
 #[async_trait]
@@ -93,11 +93,7 @@ impl NonRevokedConnectionRequestState {
 		}
 	}
 
-	pub fn on_authority_connected(
-		&mut self,
-		authority: &AuthorityDiscoveryId,
-		peer_id: &PeerId,
-	) {
+	pub fn on_authority_connected(&mut self, authority: &AuthorityDiscoveryId, peer_id: &PeerId) {
 		if self.pending.remove(authority) {
 			// an error may happen if the request was revoked or
 			// the channel's buffer is full, ignoring it is fine
@@ -122,8 +118,7 @@ impl NonRevokedConnectionRequestState {
 /// Returns `Some(id)` iff the request counter is `0`.
 fn on_revoke(map: &mut HashMap<AuthorityDiscoveryId, u64>, id: AuthorityDiscoveryId) -> Option<AuthorityDiscoveryId> {
 	if let hash_map::Entry::Occupied(mut entry) = map.entry(id) {
-		*entry.get_mut() = entry.get().saturating_sub(1);
-		if *entry.get() == 0 {
+		if entry.get_mut().saturating_sub(1) == 0 {
 			return Some(entry.remove_entry().0);
 		}
 	}
@@ -131,7 +126,7 @@ fn on_revoke(map: &mut HashMap<AuthorityDiscoveryId, u64>, id: AuthorityDiscover
 	None
 }
 
-pub(crate) fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
 	addr.iter().last().and_then(|protocol| if let Protocol::P2p(multihash) = protocol {
 		PeerId::from_multihash(multihash).ok()
 	} else {
@@ -139,15 +134,7 @@ pub(crate) fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
 	})
 }
 
-
 pub(super) struct Service<N, AD> {
-	state: PerPeerSet<StatePerPeerSet>,
-	// PhantomData used to make the struct generic instead of having generic methods
-	_phantom: PhantomData<(N, AD)>,
-}
-
-#[derive(Default)]
-struct StatePerPeerSet {
 	// Peers that are connected to us and authority ids associated to them.
 	connected_peers: HashMap<PeerId, HashSet<AuthorityDiscoveryId>>,
 	// The `u64` counts the number of pending non-revoked requests for this validator
@@ -156,12 +143,16 @@ struct StatePerPeerSet {
 	// Invariant: the value > 0 for non-revoked requests.
 	requested_validators: HashMap<AuthorityDiscoveryId, u64>,
 	non_revoked_discovery_requests: Vec<NonRevokedConnectionRequestState>,
+	// PhantomData used to make the struct generic instead of having generic methods
+	_phantom: PhantomData<(N, AD)>,
 }
 
 impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 	pub fn new() -> Self {
 		Self {
-			state: PerPeerSet::default(),
+			connected_peers: HashMap::new(),
+			requested_validators: HashMap::new(),
+			non_revoked_discovery_requests: Vec::new(),
 			_phantom: PhantomData,
 		}
 	}
@@ -173,24 +164,15 @@ impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 	async fn find_connected_validators(
 		&mut self,
 		validator_ids: &[AuthorityDiscoveryId],
-		peer_set: PeerSet,
 		authority_discovery_service: &mut AD,
 	) -> HashMap<AuthorityDiscoveryId, PeerId> {
 		let mut result = HashMap::new();
-		let state = &mut self.state[peer_set];
 
 		for id in validator_ids {
 			// First check if we already cached the validator
-			if let Some(pid) = state.connected_peers
+			if let Some(pid) = self.connected_peers
 				.iter()
-				.find_map(|(pid, ids)| {
-					if ids.contains(&id) {
-						Some(pid)
-					 } else {
-						None
-					}
-				})
-			{
+				.find_map(|(pid, ids)| if ids.contains(&id) { Some(pid) } else { None }) {
 				result.insert(id.clone(), pid.clone());
 				continue;
 			}
@@ -198,9 +180,9 @@ impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 			// If not ask the authority discovery
 			if let Some(addresses) = authority_discovery_service.get_addresses_by_authority_id(id.clone()).await {
 				for peer_id in addresses.iter().filter_map(peer_id_from_multiaddr) {
-					if let Some(ids) = state.connected_peers.get_mut(&peer_id) {
+					if let Some(ids) = self.connected_peers.get_mut(&peer_id) {
 						ids.insert(id.clone());
-						result.insert(id.clone(), peer_id);
+						result.insert(id.clone(), peer_id.clone());
 					}
 				}
 			}
@@ -220,22 +202,15 @@ impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 	pub async fn on_request(
 		&mut self,
 		validator_ids: Vec<AuthorityDiscoveryId>,
-		peer_set: PeerSet,
 		mut connected: mpsc::Sender<(AuthorityDiscoveryId, PeerId)>,
 		mut network_service: N,
 		mut authority_discovery_service: AD,
 	) -> (N, AD) {
 		const MAX_ADDR_PER_PEER: usize = 3;
 
-		let already_connected = self.find_connected_validators(
-			&validator_ids,
-			peer_set,
-			&mut authority_discovery_service,
-		).await;
-
-		let state = &mut self.state[peer_set];
 		// Increment the counter of how many times the validators were requested.
-		validator_ids.iter().for_each(|id| *state.requested_validators.entry(id.clone()).or_default() += 1);
+		validator_ids.iter().for_each(|id| *self.requested_validators.entry(id.clone()).or_default() += 1);
+		let already_connected = self.find_connected_validators(&validator_ids, &mut authority_discovery_service).await;
 
 		// try to send already connected peers
 		for (id, peer) in already_connected.iter() {
@@ -243,7 +218,7 @@ impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 				Err(e) if e.is_disconnected() => {
 					// the request is already revoked
 					for peer_id in validator_ids {
-						let _ = on_revoke(&mut state.requested_validators, peer_id);
+						let _ = on_revoke(&mut self.requested_validators, peer_id);
 					}
 					return (network_service, authority_discovery_service);
 				}
@@ -263,19 +238,21 @@ impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 			let result = authority_discovery_service.get_addresses_by_authority_id(authority.clone()).await;
 			if let Some(addresses) = result {
 				// We might have several `PeerId`s per `AuthorityId`
+				// depending on the number of sentry nodes,
+				// so we limit the max number of sentries per node to connect to.
+				// They are going to be removed soon though:
+				// https://github.com/paritytech/substrate/issues/6845
 				multiaddr_to_add.extend(addresses.into_iter().take(MAX_ADDR_PER_PEER));
-			} else {
-				tracing::debug!(target: LOG_TARGET, "Authority Discovery couldn't resolve {:?}", authority);
 			}
 		}
 
 		// clean up revoked requests
 		let mut revoked_indices = Vec::new();
 		let mut revoked_validators = Vec::new();
-		for (i, maybe_revoked) in state.non_revoked_discovery_requests.iter_mut().enumerate() {
+		for (i, maybe_revoked) in self.non_revoked_discovery_requests.iter_mut().enumerate() {
 			if maybe_revoked.is_revoked() {
 				for id in maybe_revoked.requested() {
-					if let Some(id) = on_revoke(&mut state.requested_validators, id.clone()) {
+					if let Some(id) = on_revoke(&mut self.requested_validators, id.clone()) {
 						revoked_validators.push(id);
 					}
 				}
@@ -284,40 +261,41 @@ impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 		}
 
 		// clean up revoked requests states
-		//
-		// note that the `.rev()` here is important to guarantee `swap_remove`
-		// doesn't invalidate unprocessed `revoked_indices`
 		for to_revoke in revoked_indices.into_iter().rev() {
-			drop(state.non_revoked_discovery_requests.swap_remove(to_revoke));
+			drop(self.non_revoked_discovery_requests.swap_remove(to_revoke));
 		}
 
 		// multiaddresses to remove
 		let mut multiaddr_to_remove = HashSet::new();
 		for id in revoked_validators.into_iter() {
-			let result = authority_discovery_service.get_addresses_by_authority_id(id.clone()).await;
+			let result = authority_discovery_service.get_addresses_by_authority_id(id).await;
 			if let Some(addresses) = result {
 				multiaddr_to_remove.extend(addresses.into_iter());
-			} else {
-				tracing::debug!(
-					target: LOG_TARGET,
-					"Authority Discovery couldn't resolve {:?} on cleanup, a leak is possible",
-					id,
-				);
 			}
 		}
 
 		// ask the network to connect to these nodes and not disconnect
 		// from them until removed from the set
 		if let Err(e) = network_service.add_peers_to_reserved_set(
-			peer_set.into_protocol_name(),
+			PeerSet::Collation.into_protocol_name(),
 			multiaddr_to_add.clone(),
+		).await {
+			tracing::warn!(target: LOG_TARGET, err = ?e, "AuthorityDiscoveryService returned an invalid multiaddress");
+		}
+		if let Err(e) = network_service.add_peers_to_reserved_set(
+			PeerSet::Validation.into_protocol_name(),
+			multiaddr_to_add,
 		).await {
 			tracing::warn!(target: LOG_TARGET, err = ?e, "AuthorityDiscoveryService returned an invalid multiaddress");
 		}
 		// the addresses are known to be valid
 		let _ = network_service.remove_peers_from_reserved_set(
-			peer_set.into_protocol_name(),
+			PeerSet::Collation.into_protocol_name(),
 			multiaddr_to_remove.clone()
+		).await;
+		let _ = network_service.remove_peers_from_reserved_set(
+			PeerSet::Validation.into_protocol_name(),
+			multiaddr_to_remove
 		).await;
 
 		let pending = validator_ids.iter()
@@ -325,7 +303,7 @@ impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 			.filter(|id| !already_connected.contains_key(id))
 			.collect::<HashSet<_>>();
 
-		state.non_revoked_discovery_requests.push(NonRevokedConnectionRequestState::new(
+		self.non_revoked_discovery_requests.push(NonRevokedConnectionRequestState::new(
 			validator_ids,
 			pending,
 			connected,
@@ -336,29 +314,23 @@ impl<N: Network, AD: AuthorityDiscovery> Service<N, AD> {
 
 	/// Should be called when a peer connected.
 	#[tracing::instrument(level = "trace", skip(self, authority_discovery_service), fields(subsystem = LOG_TARGET))]
-	pub async fn on_peer_connected(
-		&mut self,
-		peer_id: PeerId,
-		peer_set: PeerSet,
-		authority_discovery_service: &mut AD,
-	) {
-		let state = &mut self.state[peer_set];
+	pub async fn on_peer_connected(&mut self, peer_id: &PeerId, authority_discovery_service: &mut AD) {
 		// check if it's an authority we've been waiting for
 		let maybe_authority = authority_discovery_service.get_authority_id_by_peer_id(peer_id.clone()).await;
 		if let Some(authority) = maybe_authority {
-			for request in state.non_revoked_discovery_requests.iter_mut() {
-				let _ = request.on_authority_connected(&authority, &peer_id);
+			for request in self.non_revoked_discovery_requests.iter_mut() {
+				let _ = request.on_authority_connected(&authority, peer_id);
 			}
 
-			state.connected_peers.entry(peer_id).or_default().insert(authority);
+			self.connected_peers.entry(peer_id.clone()).or_default().insert(authority);
 		} else {
-			state.connected_peers.insert(peer_id, Default::default());
+			self.connected_peers.insert(peer_id.clone(), Default::default());
 		}
 	}
 
 	/// Should be called when a peer disconnected.
-	pub fn on_peer_disconnected(&mut self, peer_id: &PeerId, peer_set: PeerSet) {
-		self.state[peer_set].connected_peers.remove(peer_id);
+	pub fn on_peer_disconnected(&mut self, peer_id: &PeerId) {
+		self.connected_peers.remove(peer_id);
 	}
 }
 
@@ -481,11 +453,10 @@ mod tests {
 			let req1 = vec![authority_ids[0].clone(), authority_ids[1].clone()];
 			let (sender, mut receiver) = mpsc::channel(2);
 
-			service.on_peer_connected(peer_ids[0].clone(), PeerSet::Validation, &mut ads).await;
+			service.on_peer_connected(&peer_ids[0], &mut ads).await;
 
 			let _ = service.on_request(
 				req1,
-				PeerSet::Validation,
 				sender,
 				ns,
 				ads,
@@ -514,19 +485,18 @@ mod tests {
 
 			let (_, mut ads) = service.on_request(
 				req1,
-				PeerSet::Validation,
 				sender,
 				ns,
 				ads,
 			).await;
 
 
-			service.on_peer_connected(peer_ids[0].clone(), PeerSet::Validation, &mut ads).await;
+			service.on_peer_connected(&peer_ids[0], &mut ads).await;
 			let reply1 = receiver.next().await.unwrap();
 			assert_eq!(reply1.0, authority_ids[0]);
 			assert_eq!(reply1.1, peer_ids[0]);
 
-			service.on_peer_connected(peer_ids[1].clone(), PeerSet::Validation, &mut ads).await;
+			service.on_peer_connected(&peer_ids[1], &mut ads).await;
 			let reply2 = receiver.next().await.unwrap();
 			assert_eq!(reply2.0, authority_ids[1]);
 			assert_eq!(reply2.1, peer_ids[1]);
@@ -546,12 +516,11 @@ mod tests {
 		futures::executor::block_on(async move {
 			let (sender, mut receiver) = mpsc::channel(1);
 
-			service.on_peer_connected(peer_ids[0].clone(), PeerSet::Validation, &mut ads).await;
-			service.on_peer_connected(peer_ids[1].clone(), PeerSet::Validation, &mut ads).await;
+			service.on_peer_connected(&peer_ids[0], &mut ads).await;
+			service.on_peer_connected(&peer_ids[1], &mut ads).await;
 
 			let (ns, ads) = service.on_request(
 				vec![authority_ids[0].clone()],
-				PeerSet::Validation,
 				sender,
 				ns,
 				ads,
@@ -565,7 +534,6 @@ mod tests {
 
 			let _ = service.on_request(
 				vec![authority_ids[1].clone()],
-				PeerSet::Validation,
 				sender,
 				ns,
 				ads,
@@ -574,8 +542,7 @@ mod tests {
 			let reply = receiver.next().await.unwrap();
 			assert_eq!(reply.0, authority_ids[1]);
 			assert_eq!(reply.1, peer_ids[1]);
-			let state = &service.state[PeerSet::Validation];
-			assert_eq!(state.non_revoked_discovery_requests.len(), 1);
+			assert_eq!(service.non_revoked_discovery_requests.len(), 1);
 		});
 	}
 
@@ -592,12 +559,11 @@ mod tests {
 		futures::executor::block_on(async move {
 			let (sender, mut receiver) = mpsc::channel(1);
 
-			service.on_peer_connected(peer_ids[0].clone(), PeerSet::Validation, &mut ads).await;
-			service.on_peer_connected(peer_ids[1].clone(), PeerSet::Validation, &mut ads).await;
+			service.on_peer_connected(&peer_ids[0], &mut ads).await;
+			service.on_peer_connected(&peer_ids[1], &mut ads).await;
 
 			let (ns, ads) = service.on_request(
 				vec![authority_ids[0].clone(), authority_ids[2].clone()],
-				PeerSet::Validation,
 				sender,
 				ns,
 				ads,
@@ -611,15 +577,13 @@ mod tests {
 
 			let (ns, ads) = service.on_request(
 				vec![authority_ids[0].clone(), authority_ids[1].clone()],
-				PeerSet::Validation,
 				sender,
 				ns,
 				ads,
 			).await;
 
 			let _ = receiver.next().await.unwrap();
-			let state = &service.state[PeerSet::Validation];
-			assert_eq!(state.non_revoked_discovery_requests.len(), 1);
+			assert_eq!(service.non_revoked_discovery_requests.len(), 1);
 			assert_eq!(ns.peers_set.len(), 2);
 
 			// revoke the second request
@@ -629,15 +593,13 @@ mod tests {
 
 			let (ns, _) = service.on_request(
 				vec![authority_ids[0].clone()],
-				PeerSet::Validation,
 				sender,
 				ns,
 				ads,
 			).await;
 
 			let _ = receiver.next().await.unwrap();
-			let state = &service.state[PeerSet::Validation];
-			assert_eq!(state.non_revoked_discovery_requests.len(), 1);
+			assert_eq!(service.non_revoked_discovery_requests.len(), 1);
 			assert_eq!(ns.peers_set.len(), 1);
 		});
 	}
@@ -657,7 +619,7 @@ mod tests {
 		futures::executor::block_on(async move {
 			let (sender, mut receiver) = mpsc::channel(1);
 
-			service.on_peer_connected(validator_peer_id.clone(), PeerSet::Validation, &mut ads).await;
+			service.on_peer_connected(&validator_peer_id, &mut ads).await;
 
 			let address = known_multiaddr()[0].clone().with(Protocol::P2p(validator_peer_id.clone().into()));
 			ads.by_peer_id.insert(validator_peer_id.clone(), validator_id.clone());
@@ -665,20 +627,13 @@ mod tests {
 
 			let _ = service.on_request(
 				vec![validator_id.clone()],
-				PeerSet::Validation,
 				sender,
 				ns,
 				ads,
 			).await;
 
 			assert_eq!((validator_id.clone(), validator_peer_id.clone()), receiver.next().await.unwrap());
-			let state = &service.state[PeerSet::Validation];
-			assert!(
-				state.connected_peers
-					.get(&validator_peer_id)
-					.unwrap()
-					.contains(&validator_id)
-			);
+			assert!(service.connected_peers.get(&validator_peer_id).unwrap().contains(&validator_id));
 		});
 	}
 }

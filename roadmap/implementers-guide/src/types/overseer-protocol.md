@@ -63,7 +63,6 @@ enum ApprovalVotingMessage {
     /// Should not be sent unless the block hash is known.
     CheckAndImportAssignment(
         IndirectAssignmentCert,
-        CandidateIndex, // The index of the candidate included in the block.
         ResponseChannel<AssignmentCheckResult>,
     ),
     /// Check if the approval vote is valid and can be accepted by our view of the
@@ -81,7 +80,7 @@ enum ApprovalVotingMessage {
     ///
     /// It can also return the same block hash, if that is acceptable to vote upon.
     /// Return `None` if the input hash is unrecognized.
-    ApprovedAncestor(Hash, BlockNumber, ResponseChannel<Option<(Hash, BlockNumber)>>),
+    ApprovedAncestor(Hash, BlockNumber, ResponseChannel<Option<Hash>>),
 }
 ```
 
@@ -102,8 +101,8 @@ struct BlockApprovalMeta {
     /// The candidates included by the block. Note that these are not the same as the candidates that appear within the
     /// block body.
     candidates: Vec<CandidateHash>,
-    /// The consensus slot of the block.
-    slot: Slot,
+    /// The consensus slot number of the block.
+    slot_number: SlotNumber,
 }
 
 enum ApprovalDistributionMessage {
@@ -160,7 +159,6 @@ enum AvailabilityRecoveryMessage {
     RecoverAvailableData(
         CandidateReceipt,
         SessionIndex,
-        Option<GroupIndex>, // Backing validator group to request the data directly from.
         ResponseChannel<Result<AvailableData, RecoveryError>>,
     ),
 }
@@ -235,12 +233,10 @@ These messages are sent to the [Candidate Selection subsystem](../node/backing/c
 
 ```rust
 enum CandidateSelectionMessage {
-    /// A candidate collation can be fetched from a collator and should be considered for seconding.
-    Collation(RelayParent, ParaId, CollatorId),
-    /// We recommended a particular candidate to be seconded, but it was invalid; penalize the collator.
-    Invalid(RelayParent, CandidateReceipt),
-    /// The candidate we recommended to be seconded was validated successfully.
-    Seconded(RelayParent, SignedFullStatement),
+  /// A candidate collation can be fetched from a collator and should be considered for seconding.
+  Collation(RelayParent, ParaId, CollatorId),
+  /// We recommended a particular candidate to be seconded, but it was invalid; penalize the collator.
+  Invalid(CandidateReceipt),
 }
 ```
 
@@ -293,20 +289,15 @@ enum CollatorProtocolMessage {
     ///
     /// This should be sent before any `DistributeCollation` message.
     CollateOn(ParaId),
-    /// Provide a collation to distribute to validators with an optional result sender.
-    ///
-    /// The result sender should be informed when at least one parachain validator seconded the collation. It is also
-    /// completely okay to just drop the sender.
-    DistributeCollation(CandidateReceipt, PoV, Option<oneshot::Sender<SignedFullStatement>>),
+    /// Provide a collation to distribute to validators.
+    DistributeCollation(CandidateReceipt, PoV),
     /// Fetch a collation under the given relay-parent for the given ParaId.
     FetchCollation(Hash, ParaId, ResponseChannel<(CandidateReceipt, PoV)>),
     /// Report a collator as having provided an invalid collation. This should lead to disconnect
     /// and blacklist of the collator.
     ReportCollator(CollatorId),
     /// Note a collator as having provided a good collation.
-    NoteGoodCollation(CollatorId, SignedFullStatement),
-    /// Notify a collator that its collation was seconded.
-    NotifyCollationSeconded(CollatorId, SignedFullStatement),
+    NoteGoodCollation(CollatorId),
 }
 ```
 
@@ -328,9 +319,7 @@ enum PeerSet {
 
 enum NetworkBridgeMessage {
     /// Report a cost or benefit of a peer. Negative values are costs, positive are benefits.
-    ReportPeer(PeerId, cost_benefit: i32),
-    /// Disconnect a peer from the given peer-set without affecting their reputation.
-    DisconnectPeer(PeerId, PeerSet),
+    ReportPeer(PeerSet, PeerId, cost_benefit: i32),
     /// Send a message to one or more peers on the validation peerset.
     SendValidationMessage([PeerId], ValidationProtocolV1),
     /// Send a message to one or more peers on the collation peerset.
@@ -347,8 +336,6 @@ enum NetworkBridgeMessage {
     ConnectToValidators {
         /// Ids of the validators to connect to.
         validator_ids: Vec<AuthorityDiscoveryId>,
-        /// The underlying protocol to use for this request.
-        peer_set: PeerSet,
         /// Response sender by which the issuer can learn the `PeerId`s of
         /// the validators as they are connected.
         /// The response is sent immediately for already connected peers.
@@ -452,18 +439,24 @@ enum ProvisionableData {
   Dispute(Hash, Signature),
 }
 
+/// This data needs to make its way from the provisioner into the InherentData.
+///
+/// There, it is used to construct the InclusionInherent.
+type ProvisionerInherentData = (SignedAvailabilityBitfields, Vec<BackedCandidate>);
+
 /// Message to the Provisioner.
 ///
 /// In all cases, the Hash is that of the relay parent.
 enum ProvisionerMessage {
-  /// This message allows external subsystems to request current inherent data that could be used for
-  /// advancing the state of parachain consensus in a block building upon the given hash.
-  ///
-  /// If called at different points in time, this may give different results.
+  /// This message allows potential block authors to be kept updated with all new authorship data
+  /// as it becomes available.
+  RequestBlockAuthorshipData(Hash, Sender<ProvisionableData>),
+  /// This message allows external subsystems to request the set of bitfields and backed candidates
+  /// associated with a particular potential block hash.
   ///
   /// This is expected to be used by a proposer, to inject that information into the InherentData
-  /// where it can be assembled into the ParaInherent.
-  RequestInherentData(Hash, oneshot::Sender<ParaInherentData>),
+  /// where it can be assembled into the InclusionInherent.
+  RequestInherentData(Hash, oneshot::Sender<ProvisionerInherentData>),
   /// This data should become part of a relay chain block
   ProvisionableData(ProvisionableData),
 }
@@ -516,8 +509,6 @@ enum RuntimeApiRequest {
     /// Get the contents of all channels addressed to the given recipient. Channels that have no
     /// messages in them are also included.
     InboundHrmpChannelsContents(ParaId, ResponseChannel<BTreeMap<ParaId, Vec<InboundHrmpMessage<BlockNumber>>>>),
-    /// Get information about the BABE epoch this block was produced in.
-    BabeEpoch(ResponseChannel<BabeEpoch>),
 }
 
 enum RuntimeApiMessage {
@@ -543,6 +534,8 @@ enum StatementDistributionMessage {
     /// The statement distribution subsystem assumes that the statement should be correctly
     /// signed.
     Share(Hash, SignedFullStatement),
+    /// Register a listener to be notified on any new statements.
+    RegisterStatementListener(ResponseChannel<SignedFullStatement>),
 }
 ```
 

@@ -18,23 +18,17 @@ use std::collections::{HashMap, HashSet};
 
 use super::{LOG_TARGET,  Result};
 
-use futures::{select, FutureExt, channel::oneshot};
+use futures::{select, FutureExt};
 
 use polkadot_primitives::v1::{
-	CandidateHash, CandidateReceipt, CollatorId, CompressedPoV, CoreIndex,
-	CoreState, Hash, Id as ParaId,
-	PoV, ValidatorId
+	CollatorId, CoreIndex, CoreState, Hash, Id as ParaId, CandidateReceipt, PoV, ValidatorId,
 };
 use polkadot_subsystem::{
 	jaeger, PerLeafSpan,
 	FromOverseer, OverseerSignal, SubsystemContext,
-	messages::{AllMessages, CollatorProtocolMessage, NetworkBridgeMessage, NetworkBridgeEvent},
+	messages::{AllMessages, CollatorProtocolMessage, NetworkBridgeMessage},
 };
-use polkadot_node_network_protocol::{
-	OurView, PeerId, View, peer_set::PeerSet,
-	request_response::{IncomingRequest, v1::{CollationFetchingRequest, CollationFetchingResponse}},
-	v1 as protocol_v1
-};
+use polkadot_node_network_protocol::{v1 as protocol_v1, View, PeerId, NetworkBridgeEvent, RequestId, OurView};
 use polkadot_node_subsystem_util::{
 	validator_discovery,
 	request_validators_ctx,
@@ -42,7 +36,6 @@ use polkadot_node_subsystem_util::{
 	request_availability_cores_ctx,
 	metrics::{self, prometheus},
 };
-use polkadot_node_primitives::{SignedFullStatement, Statement};
 
 #[derive(Clone, Default)]
 pub struct Metrics(Option<MetricsInner>);
@@ -176,39 +169,6 @@ impl From<HashSet<ValidatorId>> for ValidatorGroup {
 	}
 }
 
-/// The status of a collation as seen from the collator.
-enum CollationStatus {
-	/// The collation was created, but we did not advertise it to any validator.
-	Created,
-	/// The collation was advertised to at least one validator.
-	Advertised,
-	/// The collation was requested by at least one validator.
-	Requested,
-}
-
-impl CollationStatus {
-	/// Advance to the [`Self::Advertised`] status.
-	///
-	/// This ensures that `self` isn't already [`Self::Requested`].
-	fn advance_to_advertised(&mut self) {
-		if !matches!(self, Self::Requested) {
-			*self = Self::Advertised;
-		}
-	}
-
-	/// Advance to the [`Self::Requested`] status.
-	fn advance_to_requested(&mut self) {
-		*self = Self::Requested;
-	}
-}
-
-/// A collation built by the collator.
-struct Collation {
-	receipt: CandidateReceipt,
-	pov: PoV,
-	status: CollationStatus,
-}
-
 #[derive(Default)]
 struct State {
 	/// Our id.
@@ -231,10 +191,7 @@ struct State {
 	/// Possessed collations.
 	///
 	/// We will keep up to one local collation per relay-parent.
-	collations: HashMap<Hash, Collation>,
-
-	/// The result senders per collation.
-	collation_result_senders: HashMap<CandidateHash, oneshot::Sender<SignedFullStatement>>,
+	collations: HashMap<Hash, (CandidateReceipt, PoV)>,
 
 	/// Our validator groups per active leaf.
 	our_validators_groups: HashMap<Hash, ValidatorGroup>,
@@ -271,7 +228,6 @@ async fn distribute_collation(
 	id: ParaId,
 	receipt: CandidateReceipt,
 	pov: PoV,
-	result_sender: Option<oneshot::Sender<SignedFullStatement>>,
 ) -> Result<()> {
 	let relay_parent = receipt.descriptor.relay_parent;
 
@@ -279,7 +235,7 @@ async fn distribute_collation(
 	if !state.view.contains(&relay_parent) {
 		tracing::warn!(
 			target: LOG_TARGET,
-			?relay_parent,
+			relay_parent = %relay_parent,
 			"distribute collation message parent is outside of our view",
 		);
 
@@ -299,7 +255,7 @@ async fn distribute_collation(
 			tracing::warn!(
 				target: LOG_TARGET,
 				para_id = %id,
-				?relay_parent,
+				relay_parent = %relay_parent,
 				"looks like no core is assigned to {} at {}", id, relay_parent,
 			);
 
@@ -320,33 +276,12 @@ async fn distribute_collation(
 		return Ok(());
 	}
 
-	tracing::debug!(
-		target: LOG_TARGET,
-		para_id = %id,
-		relay_parent = %relay_parent,
-		candidate_hash = ?receipt.hash(),
-		pov_hash = ?pov.hash(),
-		core = ?our_core,
-		?current_validators,
-		?next_validators,
-		"Accepted collation, connecting to validators."
-	);
 	// Issue a discovery request for the validators of the current group and the next group.
-	connect_to_validators(
-		ctx,
-		relay_parent,
-		id,
-		state,
-		current_validators.union(&next_validators).cloned().collect(),
-	).await?;
+	connect_to_validators(ctx, relay_parent, state, current_validators.union(&next_validators).cloned().collect()).await?;
 
 	state.our_validators_groups.insert(relay_parent, current_validators.into());
 
-	if let Some(result_sender) = result_sender {
-		state.collation_result_senders.insert(receipt.hash(), result_sender);
-	}
-
-	state.collations.insert(relay_parent, Collation { receipt, pov, status: CollationStatus::Created });
+	state.collations.insert(relay_parent, (receipt, pov));
 
 	Ok(())
 }
@@ -394,8 +329,8 @@ async fn determine_our_validators(
 
 	let validators = request_validators_ctx(relay_parent, ctx).await?.await??;
 
-	let current_validators = current_validators.iter().map(|i| validators[i.0 as usize].clone()).collect();
-	let next_validators = next_validators.iter().map(|i| validators[i.0 as usize].clone()).collect();
+	let current_validators = current_validators.iter().map(|i| validators[*i as usize].clone()).collect();
+	let next_validators = next_validators.iter().map(|i| validators[*i as usize].clone()).collect();
 
 	Ok((current_validators, next_validators))
 }
@@ -423,7 +358,6 @@ async fn declare(
 async fn connect_to_validators(
 	ctx: &mut impl SubsystemContext<Message = CollatorProtocolMessage>,
 	relay_parent: Hash,
-	para_id: ParaId,
 	state: &mut State,
 	validators: Vec<ValidatorId>,
 ) -> Result<()> {
@@ -431,10 +365,9 @@ async fn connect_to_validators(
 		ctx,
 		relay_parent,
 		validators,
-		PeerSet::Collation,
 	).await?;
 
-	state.connection_requests.put(relay_parent, para_id, request);
+	state.connection_requests.put(relay_parent, request);
 
 	Ok(())
 }
@@ -460,34 +393,8 @@ async fn advertise_collation(
 		.map(|g| g.should_advertise_to(&peer))
 		.unwrap_or(false);
 
-	match (state.collations.get_mut(&relay_parent), should_advertise) {
-		(None, _) => {
-			tracing::debug!(
-				target: LOG_TARGET,
-				?relay_parent,
-				peer_id = %peer,
-				"No collation to advertise.",
-			);
-			return
-		},
-		(_, false) => {
-			tracing::debug!(
-				target: LOG_TARGET,
-				?relay_parent,
-				peer_id = %peer,
-				"Not advertising collation as we already advertised it to this validator.",
-			);
-			return
-		}
-		(Some(collation), true) => {
-			tracing::debug!(
-				target: LOG_TARGET,
-				?relay_parent,
-				peer_id = %peer,
-				"Advertising collation.",
-			);
-			collation.status.advance_to_advertised()
-		},
+	if !state.collations.contains_key(&relay_parent) || !should_advertise {
+		return;
 	}
 
 	let wire_message = protocol_v1::CollatorProtocolMessage::AdvertiseCollation(relay_parent, collating_on);
@@ -521,10 +428,10 @@ async fn process_msg(
 		CollateOn(id) => {
 			state.collating_on = Some(id);
 		}
-		DistributeCollation(receipt, pov, result_sender) => {
+		DistributeCollation(receipt, pov) => {
 			let _span1 = state.span_per_relay_parent
 				.get(&receipt.descriptor.relay_parent).map(|s| s.child("distributing-collation"));
-			let _span2 = jaeger::Span::new(&pov, "distributing-collation");
+			let _span2 = jaeger::pov_span(&pov, "distributing-collation");
 			match state.collating_on {
 				Some(id) if receipt.descriptor.para_id != id => {
 					// If the ParaId of a collation requested to be distributed does not match
@@ -537,7 +444,7 @@ async fn process_msg(
 					);
 				}
 				Some(id) => {
-					distribute_collation(ctx, state, id, receipt, pov, result_sender).await?;
+					distribute_collation(ctx, state, id, receipt, pov).await?;
 				}
 				None => {
 					tracing::warn!(
@@ -566,12 +473,6 @@ async fn process_msg(
 				"NoteGoodCollation message is not expected on the collator side of the protocol",
 			);
 		}
-		NotifyCollationSeconded(_, _) => {
-			tracing::warn!(
-				target: LOG_TARGET,
-				"NotifyCollationSeconded message is not expected on the collator side of the protocol",
-			);
-		}
 		NetworkBridgeUpdateV1(event) => {
 			if let Err(e) = handle_network_msg(
 				ctx,
@@ -585,90 +486,49 @@ async fn process_msg(
 				);
 			}
 		},
-		CollationFetchingRequest(incoming) => {
-			let _span = state.span_per_relay_parent.get(&incoming.payload.relay_parent).map(|s| s.child("request-collation"));
-			match state.collating_on {
-				Some(our_para_id) => {
-					if our_para_id == incoming.payload.para_id {
-						let (receipt, pov) = if let Some(collation) = state.collations.get_mut(&incoming.payload.relay_parent) {
-							collation.status.advance_to_requested();
-							(collation.receipt.clone(), collation.pov.clone())
-						} else {
-							tracing::warn!(
-								target: LOG_TARGET,
-								relay_parent = %incoming.payload.relay_parent,
-								"received a `RequestCollation` for a relay parent we don't have collation stored.",
-							);
-
-							return Ok(());
-						};
-
-						let _span = _span.as_ref().map(|s| s.child("sending"));
-						send_collation(state, incoming, receipt, pov).await;
-					} else {
-						tracing::warn!(
-							target: LOG_TARGET,
-							for_para_id = %incoming.payload.para_id,
-							our_para_id = %our_para_id,
-							"received a `CollationFetchingRequest` for unexpected para_id",
-						);
-					}
-				}
-				None => {
-					tracing::warn!(
-						target: LOG_TARGET,
-						for_para_id = %incoming.payload.para_id,
-						"received a `RequestCollation` while not collating on any para",
-					);
-				}
-			}
-		}
 	}
 
 	Ok(())
 }
 
 /// Issue a response to a previously requested collation.
-#[tracing::instrument(level = "trace", skip(state, pov), fields(subsystem = LOG_TARGET))]
+#[tracing::instrument(level = "trace", skip(ctx, state, pov), fields(subsystem = LOG_TARGET))]
 async fn send_collation(
+	ctx: &mut impl SubsystemContext<Message = CollatorProtocolMessage>,
 	state: &mut State,
-	request: IncomingRequest<CollationFetchingRequest>,
+	request_id: RequestId,
+	origin: PeerId,
 	receipt: CandidateReceipt,
 	pov: PoV,
 ) {
-	let pov = match CompressedPoV::compress(&pov) {
-		Ok(compressed) => {
-			tracing::trace!(
-				target: LOG_TARGET,
-				size = %pov.block_data.0.len(),
-				compressed = %compressed.len(),
-				peer_id = ?request.peer,
-				"Sending collation."
-			);
-			compressed
-		},
+	let pov = match protocol_v1::CompressedPoV::compress(&pov) {
+		Ok(pov) => pov,
 		Err(error) => {
-			tracing::error!(
+			tracing::debug!(
 				target: LOG_TARGET,
-				?error,
+				error = ?error,
 				"Failed to create `CompressedPov`",
 			);
 			return
 		}
 	};
 
-	if let Err(_) = request.send_response(CollationFetchingResponse::Collation(receipt, pov)) {
-		tracing::warn!(
-			target: LOG_TARGET,
-			"Sending collation response failed",
-		);
-	}
+	let wire_message = protocol_v1::CollatorProtocolMessage::Collation(request_id, receipt, pov);
+
+	ctx.send_message(AllMessages::NetworkBridge(
+		NetworkBridgeMessage::SendCollationMessage(
+			vec![origin],
+			protocol_v1::CollationProtocol::CollatorProtocol(wire_message),
+		)
+	)).await;
+
 	state.metrics.on_collation_sent();
 }
 
 /// A networking messages switch.
-#[tracing::instrument(level = "trace", skip(state), fields(subsystem = LOG_TARGET))]
+#[tracing::instrument(level = "trace", skip(ctx, state), fields(subsystem = LOG_TARGET))]
 async fn handle_incoming_peer_message(
+	ctx: &mut impl SubsystemContext<Message = CollatorProtocolMessage>,
 	state: &mut State,
 	origin: PeerId,
 	msg: protocol_v1::CollatorProtocolMessage,
@@ -679,34 +539,47 @@ async fn handle_incoming_peer_message(
 		Declare(_) => {
 			tracing::warn!(
 				target: LOG_TARGET,
-				?origin,
 				"Declare message is not expected on the collator side of the protocol",
 			);
 		}
 		AdvertiseCollation(_, _) => {
 			tracing::warn!(
 				target: LOG_TARGET,
-				?origin,
 				"AdvertiseCollation message is not expected on the collator side of the protocol",
 			);
 		}
-		CollationSeconded(statement) => {
-			if !matches!(statement.payload(), Statement::Seconded(_)) {
-				tracing::warn!(
-					target: LOG_TARGET,
-					?statement,
-					?origin,
-					"Collation seconded message received with none-seconded statement.",
-				);
-			} else if let Some(sender) = state.collation_result_senders.remove(&statement.payload().candidate_hash()) {
-				tracing::trace!(
-					target: LOG_TARGET,
-					?statement,
-					?origin,
-					"received a `CollationSeconded`",
-				);
-				let _ = sender.send(statement);
+		RequestCollation(request_id, relay_parent, para_id) => {
+			let _span = state.span_per_relay_parent.get(&relay_parent).map(|s| s.child("request-collation"));
+			match state.collating_on {
+				Some(our_para_id) => {
+					if our_para_id == para_id {
+						if let Some(collation) = state.collations.get(&relay_parent).cloned() {
+							let _span = _span.as_ref().map(|s| s.child("sending"));
+							send_collation(ctx, state, request_id, origin, collation.0, collation.1).await;
+						}
+					} else {
+						tracing::warn!(
+							target: LOG_TARGET,
+							for_para_id = %para_id,
+							our_para_id = %our_para_id,
+							"received a RequestCollation for unexpected para_id",
+						);
+					}
+				}
+				None => {
+					tracing::warn!(
+						target: LOG_TARGET,
+						for_para_id = %para_id,
+						"received a RequestCollation while not collating on any para",
+					);
+				}
 			}
+		}
+		Collation(_, _, _) => {
+			tracing::warn!(
+				target: LOG_TARGET,
+				"Collation message is not expected on the collator side of the protocol",
+			);
 		}
 	}
 
@@ -773,44 +646,22 @@ async fn handle_network_msg(
 	use NetworkBridgeEvent::*;
 
 	match bridge_message {
-		PeerConnected(peer_id, observed_role) => {
+		PeerConnected(_peer_id, _observed_role) => {
 			// If it is possible that a disconnected validator would attempt a reconnect
 			// it should be handled here.
-			tracing::trace!(
-				target: LOG_TARGET,
-				?peer_id,
-				?observed_role,
-				"Peer connected",
-			);
 		}
 		PeerViewChange(peer_id, view) => {
-			tracing::trace!(
-				target: LOG_TARGET,
-				?peer_id,
-				?view,
-				"Peer view change",
-			);
 			handle_peer_view_change(ctx, state, peer_id, view).await;
 		}
 		PeerDisconnected(peer_id) => {
-			tracing::trace!(
-				target: LOG_TARGET,
-				?peer_id,
-				"Peer disconnected",
-			);
 			state.peer_views.remove(&peer_id);
 			state.declared_at.remove(&peer_id);
 		}
 		OurViewChange(view) => {
-			tracing::trace!(
-				target: LOG_TARGET,
-				?view,
-				"Own view change",
-			);
 			handle_our_view_change(state, view).await?;
 		}
 		PeerMessage(remote, msg) => {
-			handle_incoming_peer_message(state, remote, msg).await?;
+			handle_incoming_peer_message(ctx, state, remote, msg).await?;
 		}
 	}
 
@@ -824,34 +675,9 @@ async fn handle_our_view_change(
 	view: OurView,
 ) -> Result<()> {
 	for removed in state.view.difference(&view) {
-		tracing::debug!(target: LOG_TARGET, relay_parent = ?removed, "Removing relay parent because our view changed.");
-
-		if let Some(collation) = state.collations.remove(removed) {
-			state.collation_result_senders.remove(&collation.receipt.hash());
-
-			match collation.status {
-				CollationStatus::Created => tracing::warn!(
-					target: LOG_TARGET,
-					candidate_hash = ?collation.receipt.hash(),
-					pov_hash = ?collation.pov.hash(),
-					"Collation wasn't advertised to any validator.",
-				),
-				CollationStatus::Advertised => tracing::debug!(
-					target: LOG_TARGET,
-					candidate_hash = ?collation.receipt.hash(),
-					pov_hash = ?collation.pov.hash(),
-					"Collation was advertised but not requested by any validator.",
-				),
-				CollationStatus::Requested => tracing::debug!(
-					target: LOG_TARGET,
-					candidate_hash = ?collation.receipt.hash(),
-					pov_hash = ?collation.pov.hash(),
-					"Collation was requested.",
-				)
-			}
-		}
+		state.collations.remove(removed);
 		state.our_validators_groups.remove(removed);
-		state.connection_requests.remove_all(removed);
+		state.connection_requests.remove(removed);
 		state.span_per_relay_parent.remove(removed);
 	}
 
@@ -912,7 +738,7 @@ mod tests {
 	use assert_matches::assert_matches;
 	use futures::{executor, future, Future, channel::mpsc};
 
-	use sp_core::{crypto::Pair, Decode};
+	use sp_core::crypto::Pair;
 	use sp_keyring::Sr25519Keyring;
 
 	use polkadot_primitives::v1::{
@@ -920,14 +746,10 @@ mod tests {
 		ValidatorIndex, GroupRotationInfo, AuthorityDiscoveryId,
 		SessionIndex, SessionInfo,
 	};
-	use polkadot_subsystem::{ActiveLeavesUpdate, messages::{RuntimeApiMessage, RuntimeApiRequest}, jaeger};
+	use polkadot_subsystem::{ActiveLeavesUpdate, messages::{RuntimeApiMessage, RuntimeApiRequest}, JaegerSpan};
 	use polkadot_node_subsystem_util::TimeoutExt;
 	use polkadot_subsystem_testhelpers as test_helpers;
-	use polkadot_node_network_protocol::{
-		our_view,
-		view,
-		request_response::request::IncomingRequest,
-	};
+	use polkadot_node_network_protocol::{view, our_view};
 
 	#[derive(Default)]
 	struct TestCandidateBuilder {
@@ -992,8 +814,7 @@ mod tests {
 				.take(validator_public.len())
 				.collect();
 
-			let validator_groups = vec![vec![2, 0, 4], vec![3, 2, 4]]
-				.into_iter().map(|g| g.into_iter().map(ValidatorIndex).collect()).collect();
+			let validator_groups = vec![vec![2, 0, 4], vec![3, 2, 4]];
 			let group_rotation_info = GroupRotationInfo {
 				session_start_block: 0,
 				group_rotation_frequency: 100,
@@ -1035,20 +856,20 @@ mod tests {
 		}
 
 		fn current_group_validator_peer_ids(&self) -> Vec<PeerId> {
-			self.current_group_validator_indices().iter().map(|i| self.validator_peer_id[i.0 as usize].clone()).collect()
+			self.current_group_validator_indices().iter().map(|i| self.validator_peer_id[*i as usize].clone()).collect()
 		}
 
 		fn current_group_validator_authority_ids(&self) -> Vec<AuthorityDiscoveryId> {
 			self.current_group_validator_indices()
 				.iter()
-				.map(|i| self.validator_authority_id[i.0 as usize].clone())
+				.map(|i| self.validator_authority_id[*i as usize].clone())
 				.collect()
 		}
 
 		fn current_group_validator_ids(&self) -> Vec<ValidatorId> {
 			self.current_group_validator_indices()
 				.iter()
-				.map(|i| self.validator_public[i.0 as usize].clone())
+				.map(|i| self.validator_public[*i as usize].clone())
 				.collect()
 		}
 
@@ -1059,7 +880,7 @@ mod tests {
 		fn next_group_validator_authority_ids(&self) -> Vec<AuthorityDiscoveryId> {
 			self.next_group_validator_indices()
 				.iter()
-				.map(|i| self.validator_authority_id[i.0 as usize].clone())
+				.map(|i| self.validator_authority_id[*i as usize].clone())
 				.collect()
 		}
 
@@ -1129,7 +950,7 @@ mod tests {
 		overseer: &mut test_helpers::TestSubsystemContextHandle<CollatorProtocolMessage>,
 		msg: CollatorProtocolMessage,
 	) {
-		tracing::trace!(?msg, "sending message");
+		tracing::trace!(msg = ?msg, "sending message");
 		overseer
 			.send(FromOverseer::Communication { msg })
 			.timeout(TIMEOUT)
@@ -1144,7 +965,7 @@ mod tests {
 			.await
 			.expect(&format!("{:?} is more than enough to receive messages", TIMEOUT));
 
-		tracing::trace!(?msg, "received message");
+		tracing::trace!(msg = ?msg, "received message");
 
 		msg
 	}
@@ -1181,7 +1002,7 @@ mod tests {
 		overseer_signal(
 			virtual_overseer,
 			OverseerSignal::ActiveLeaves(ActiveLeavesUpdate {
-				activated: [(test_state.relay_parent, Arc::new(jaeger::Span::Disabled))][..].into(),
+				activated: [(test_state.relay_parent, Arc::new(JaegerSpan::Disabled))][..].into(),
 				deactivated: [][..].into(),
 			}),
 		).await;
@@ -1223,7 +1044,7 @@ mod tests {
 
 		overseer_send(
 			virtual_overseer,
-			CollatorProtocolMessage::DistributeCollation(candidate.clone(), pov_block.clone(), None),
+			CollatorProtocolMessage::DistributeCollation(candidate.clone(), pov_block.clone()),
 		).await;
 
 		// obtain the availability cores.
@@ -1398,7 +1219,7 @@ mod tests {
 		overseer_send(
 			virtual_overseer,
 			CollatorProtocolMessage::NetworkBridgeUpdateV1(
-				NetworkBridgeEvent::PeerViewChange(peer.clone(), View::new(hashes, 0)),
+				NetworkBridgeEvent::PeerViewChange(peer.clone(), View { heads: hashes, finalized_number: 0 }),
 			),
 		).await;
 	}
@@ -1435,33 +1256,41 @@ mod tests {
 			// advertise it.
 			expect_advertise_collation_msg(&mut virtual_overseer, &test_state, &peer, test_state.relay_parent).await;
 
+			let request_id = 42;
+
 			// Request a collation.
-			let (tx, rx) = oneshot::channel();
 			overseer_send(
 				&mut virtual_overseer,
-				CollatorProtocolMessage::CollationFetchingRequest(
-					IncomingRequest::new(
-						peer,
-						CollationFetchingRequest {
-							relay_parent: test_state.relay_parent,
-							para_id: test_state.para_id,
-						},
-						tx,
+				CollatorProtocolMessage::NetworkBridgeUpdateV1(
+					NetworkBridgeEvent::PeerMessage(
+						peer.clone(),
+						protocol_v1::CollatorProtocolMessage::RequestCollation(
+							request_id,
+							test_state.relay_parent,
+							test_state.para_id,
+						)
 					)
 				)
 			).await;
 
+			// Wait for the reply.
 			assert_matches!(
-				rx.await,
-				Ok(full_response) => {
-					let CollationFetchingResponse::Collation(receipt, pov): CollationFetchingResponse
-						= CollationFetchingResponse::decode(
-							&mut full_response.result
-							.expect("We should have a proper answer").as_ref()
+				overseer_recv(&mut virtual_overseer).await,
+				AllMessages::NetworkBridge(
+					NetworkBridgeMessage::SendCollationMessage(
+						to,
+						protocol_v1::CollationProtocol::CollatorProtocol(wire_message),
 					)
-					.expect("Decoding should work");
-					assert_eq!(receipt, candidate);
-					assert_eq!(pov.decompress().unwrap(), pov_block);
+				) => {
+					assert_eq!(to, vec![peer]);
+					assert_matches!(
+						wire_message,
+						protocol_v1::CollatorProtocolMessage::Collation(req_id, receipt, pov) => {
+							assert_eq!(req_id, request_id);
+							assert_eq!(receipt, candidate);
+							assert_eq!(pov.decompress().unwrap(), pov_block);
+						}
+					);
 				}
 			);
 
@@ -1471,25 +1300,19 @@ mod tests {
 			let peer = test_state.validator_peer_id[2].clone();
 
 			// Re-request a collation.
-			let (tx, rx) = oneshot::channel();
 			overseer_send(
 				&mut virtual_overseer,
-				CollatorProtocolMessage::CollationFetchingRequest(
-					IncomingRequest::new(
-						peer,
-						CollationFetchingRequest {
-							relay_parent: old_relay_parent,
-							para_id: test_state.para_id,
-						},
-						tx,
+				CollatorProtocolMessage::NetworkBridgeUpdateV1(
+					NetworkBridgeEvent::PeerMessage(
+						peer.clone(),
+						protocol_v1::CollatorProtocolMessage::RequestCollation(
+							43,
+							old_relay_parent,
+							test_state.para_id,
+						)
 					)
 				)
 			).await;
-			// Re-requesting collation should fail:
-			assert_matches!(
-				rx.await,
-				Err(_) => {}
-			);
 
 			assert!(overseer_recv_with_timeout(&mut virtual_overseer, TIMEOUT).await.is_none());
 

@@ -48,6 +48,9 @@ use frame_support::{
 use parity_scale_codec::{Encode, Decode};
 use sp_runtime::traits::{One, Saturating};
 
+use rand::{SeedableRng, seq::SliceRandom};
+use rand_chacha::ChaCha20Rng;
+
 use crate::{configuration, paras, initializer::SessionChangeNotification};
 
 /// A queued parathread entry, pre-assigned to a core.
@@ -154,9 +157,7 @@ pub trait Config: frame_system::Config + configuration::Config + paras::Config {
 
 decl_storage! {
 	trait Store for Module<T: Config> as ParaScheduler {
-		/// All the validator groups. One for each core. Indices are into `ActiveValidators` - not the
-		/// broader set of Polkadot validators, but instead just the subset used for parachains during
-		/// this session.
+		/// All the validator groups. One for each core.
 		///
 		/// Bound: The number of cores is the sum of the numbers of parachains and parathread multiplexers.
 		/// Reasonably, 100-1000. The dominant factor is the number of validators: safe upper bound at 10k.
@@ -222,6 +223,7 @@ impl<T: Config> Module<T> {
 	pub(crate) fn initializer_on_new_session(notification: &SessionChangeNotification<T::BlockNumber>) {
 		let &SessionChangeNotification {
 			ref validators,
+			ref random_seed,
 			ref new_config,
 			..
 		} = notification;
@@ -257,26 +259,27 @@ impl<T: Config> Module<T> {
 		if n_cores == 0 || validators.is_empty() {
 			ValidatorGroups::set(Vec::new());
 		} else {
-			let group_base_size = validators.len() / n_cores as usize;
-			let n_larger_groups = validators.len() % n_cores as usize;
+			let mut rng: ChaCha20Rng = SeedableRng::from_seed(*random_seed);
 
-			// Groups contain indices into the validators from the session change notification,
-			// which are already shuffled.
+			let mut shuffled_indices: Vec<_> = (0..validators.len())
+				.enumerate()
+				.map(|(i, _)| i as ValidatorIndex)
+				.collect();
 
-			let mut groups: Vec<Vec<ValidatorIndex>> = Vec::new();
-			for i in 0..n_larger_groups {
-				let offset = (group_base_size + 1) * i;
-				groups.push(
-					(0..group_base_size + 1).map(|j| offset + j).map(|j| ValidatorIndex(j as _)).collect()
-				);
-			}
+			shuffled_indices.shuffle(&mut rng);
 
-			for i in 0..(n_cores as usize - n_larger_groups) {
-				let offset = (n_larger_groups * (group_base_size + 1)) + (i * group_base_size);
-				groups.push(
-					(0..group_base_size).map(|j| offset + j).map(|j| ValidatorIndex(j as _)).collect()
-				);
-			}
+			let group_base_size = shuffled_indices.len() / n_cores as usize;
+			let n_larger_groups = shuffled_indices.len() % n_cores as usize;
+
+			let groups: Vec<Vec<_>> = (0..n_cores).map(|core_id| {
+				let n_members = if (core_id as usize) < n_larger_groups {
+					group_base_size + 1
+				} else {
+					group_base_size
+				};
+
+				shuffled_indices.drain(shuffled_indices.len() - n_members ..).rev().collect()
+			}).collect();
 
 			ValidatorGroups::set(groups);
 		}
@@ -323,7 +326,7 @@ impl<T: Config> Module<T> {
 		});
 		ParathreadQueue::set(thread_queue);
 
-		let now = <frame_system::Pallet<T>>::block_number() + One::one();
+		let now = <frame_system::Module<T>>::block_number() + One::one();
 		<SessionStartBlock<T>>::set(now);
 	}
 
@@ -587,7 +590,7 @@ impl<T: Config> Module<T> {
 	/// https://github.com/rust-lang/rust/issues/73226
 	/// which prevents us from testing the code if using `impl Trait`.
 	pub(crate) fn availability_timeout_predicate() -> Option<Box<dyn Fn(CoreIndex, T::BlockNumber) -> bool>> {
-		let now = <frame_system::Pallet<T>>::block_number();
+		let now = <frame_system::Module<T>>::block_number();
 		let config = <configuration::Module<T>>::config();
 
 		let session_start = <SessionStartBlock<T>>::get();
@@ -728,30 +731,18 @@ impl<T: Config> Module<T> {
 	}
 }
 
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	use primitives::v1::{BlockNumber, ValidatorId, CollatorId, SessionIndex};
-	use frame_support::{
-		assert_ok,
-		traits::{OnFinalize, OnInitialize},
-	};
+	use primitives::v1::{BlockNumber, ValidatorId, CollatorId};
+	use frame_support::traits::{OnFinalize, OnInitialize};
 	use keyring::Sr25519Keyring;
 
-	use crate::mock::{new_test_ext, Configuration, Paras, Shared, System, Scheduler, MockGenesisConfig};
+	use crate::mock::{new_test_ext, Configuration, Paras, System, Scheduler, GenesisConfig as MockGenesisConfig};
 	use crate::initializer::SessionChangeNotification;
 	use crate::configuration::HostConfiguration;
 	use crate::paras::ParaGenesisArgs;
-
-	fn schedule_blank_para(id: ParaId, is_chain: bool) {
-		assert_ok!(Paras::schedule_para_initialize(id, ParaGenesisArgs {
-			genesis_head: Vec::new().into(),
-			validation_code: Vec::new().into(),
-			parachain: is_chain,
-		}));
-	}
 
 	fn run_to_block(
 		to: BlockNumber,
@@ -764,13 +755,8 @@ mod tests {
 			Paras::initializer_finalize();
 
 			if let Some(notification) = new_session(b + 1) {
-				let mut notification_with_session_index = notification;
-				// We will make every session change trigger an action queue. Normally this may require 2 or more session changes.
-				if notification_with_session_index.session_index == SessionIndex::default() {
-					notification_with_session_index.session_index = Shared::scheduled_session();
-				}
-				Paras::initializer_on_new_session(&notification_with_session_index);
-				Scheduler::initializer_on_new_session(&notification_with_session_index);
+				Paras::initializer_on_new_session(&notification);
+				Scheduler::initializer_on_new_session(&notification);
 			}
 
 			System::on_finalize(b);
@@ -830,7 +816,11 @@ mod tests {
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
 
 		new_test_ext(genesis_config).execute_with(|| {
-			schedule_blank_para(thread_id, false);
+			Paras::schedule_para_initialize(thread_id, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: false,
+			});
 
 			assert!(!Paras::is_parathread(thread_id));
 
@@ -905,7 +895,11 @@ mod tests {
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
 
 		new_test_ext(genesis_config).execute_with(|| {
-			schedule_blank_para(thread_id, false);
+			Paras::schedule_para_initialize(thread_id, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: false,
+			});
 
 			assert!(!Paras::is_parathread(thread_id));
 
@@ -941,9 +935,23 @@ mod tests {
 
 			// threads a, b, and c will be live in next session, but not d.
 			{
-				schedule_blank_para(thread_a, false);
-				schedule_blank_para(thread_b, false);
-				schedule_blank_para(thread_c, false);
+				Paras::schedule_para_initialize(thread_a, ParaGenesisArgs {
+					genesis_head: Vec::new().into(),
+					validation_code: Vec::new().into(),
+					parachain: false,
+				});
+
+				Paras::schedule_para_initialize(thread_b, ParaGenesisArgs {
+					genesis_head: Vec::new().into(),
+					validation_code: Vec::new().into(),
+					parachain: false,
+				});
+
+				Paras::schedule_para_initialize(thread_c, ParaGenesisArgs {
+					genesis_head: Vec::new().into(),
+					validation_code: Vec::new().into(),
+					parachain: false,
+				});
 			}
 
 			// set up a queue as if n_cores was 4 and with some with many retries.
@@ -1033,9 +1041,16 @@ mod tests {
 			let chain_b = ParaId::from(2);
 
 			// ensure that we have 5 groups by registering 2 parachains.
-			schedule_blank_para(chain_a, true);
-			schedule_blank_para(chain_b, true);
-
+			Paras::schedule_para_initialize(chain_a, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: true,
+			});
+			Paras::schedule_para_initialize(chain_b, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: true,
+			});
 
 			run_to_block(1, |number| match number {
 				1 => Some(SessionChangeNotification {
@@ -1092,10 +1107,21 @@ mod tests {
 			let chain_c = ParaId::from(3);
 
 			// ensure that we have 5 groups by registering 2 parachains.
-			schedule_blank_para(chain_a, true);
-			schedule_blank_para(chain_b, true);
-			schedule_blank_para(chain_c, false);
-
+			Paras::schedule_para_initialize(chain_a, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: true,
+			});
+			Paras::schedule_para_initialize(chain_b, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: true,
+			});
+			Paras::schedule_para_initialize(chain_c, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: false,
+			});
 
 			run_to_block(1, |number| match number {
 				1 => Some(SessionChangeNotification {
@@ -1143,6 +1169,12 @@ mod tests {
 		let thread_c = ParaId::from(5);
 
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
+
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
 
 		new_test_ext(genesis_config).execute_with(|| {
 			assert_eq!(default_config().parathread_cores, 3);
@@ -1252,6 +1284,12 @@ mod tests {
 		let thread_e = ParaId::from(7);
 
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
+
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
 
 		new_test_ext(genesis_config).execute_with(|| {
 			assert_eq!(default_config().parathread_cores, 3);
@@ -1404,6 +1442,12 @@ mod tests {
 		let chain_b = ParaId::from(2);
 		let chain_c = ParaId::from(3);
 
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
+
 		new_test_ext(genesis_config).execute_with(|| {
 			assert_eq!(default_config().parathread_cores, 3);
 
@@ -1508,6 +1552,12 @@ mod tests {
 
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
 
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
+
 		new_test_ext(genesis_config).execute_with(|| {
 			assert_eq!(default_config().parathread_cores, 3);
 
@@ -1580,6 +1630,12 @@ mod tests {
 
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
 
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
+
 		new_test_ext(genesis_config).execute_with(|| {
 			assert_eq!(default_config().parathread_cores, 3);
 
@@ -1638,6 +1694,12 @@ mod tests {
 
 		let chain_a = ParaId::from(1);
 		let thread_a = ParaId::from(2);
+
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
 
 		new_test_ext(genesis_config).execute_with(|| {
 			schedule_blank_para(chain_a, true);
@@ -1736,6 +1798,12 @@ mod tests {
 
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
 
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
+
 		new_test_ext(genesis_config).execute_with(|| {
 			schedule_blank_para(thread_a, false);
 			schedule_blank_para(thread_b, false);
@@ -1810,6 +1878,12 @@ mod tests {
 		let thread_b = ParaId::from(2);
 
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
+
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
 
 		new_test_ext(genesis_config).execute_with(|| {
 			schedule_blank_para(thread_a, false);
@@ -1892,6 +1966,12 @@ mod tests {
 
 		let chain_a = ParaId::from(1);
 
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
+
 		new_test_ext(genesis_config).execute_with(|| {
 			schedule_blank_para(chain_a, true);
 
@@ -1948,6 +2028,12 @@ mod tests {
 		};
 
 		let chain_a = ParaId::from(1);
+
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
 
 		new_test_ext(genesis_config).execute_with(|| {
 			schedule_blank_para(chain_a, true);
@@ -2007,9 +2093,16 @@ mod tests {
 			let chain_b = ParaId::from(2);
 
 			// ensure that we have 5 groups by registering 2 parachains.
-			schedule_blank_para(chain_a, true);
-			schedule_blank_para(chain_b, true);
-
+			Paras::schedule_para_initialize(chain_a, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: true,
+			});
+			Paras::schedule_para_initialize(chain_b, ParaGenesisArgs {
+				genesis_head: Vec::new().into(),
+				validation_code: Vec::new().into(),
+				parachain: true,
+			});
 
 			run_to_block(1, |number| match number {
 				1 => Some(SessionChangeNotification {
@@ -2034,7 +2127,7 @@ mod tests {
 			let groups = ValidatorGroups::get();
 			assert_eq!(groups.len(), 5);
 
-			assert_ok!(Paras::schedule_para_cleanup(chain_b));
+			Paras::schedule_para_cleanup(chain_b);
 
 			run_to_end_of_block(2, |number| match number {
 				2 => Some(SessionChangeNotification {
@@ -2086,6 +2179,12 @@ mod tests {
 
 		let collator = CollatorId::from(Sr25519Keyring::Alice.public());
 
+		let schedule_blank_para = |id, is_chain| Paras::schedule_para_initialize(id, ParaGenesisArgs {
+			genesis_head: Vec::new().into(),
+			validation_code: Vec::new().into(),
+			parachain: is_chain,
+		});
+
 		new_test_ext(genesis_config).execute_with(|| {
 			assert_eq!(default_config().parathread_cores, 3);
 
@@ -2111,7 +2210,7 @@ mod tests {
 			run_to_block(2, |_| None);
 			assert_eq!(Scheduler::scheduled().len(), 2);
 
-			assert_ok!(Paras::schedule_para_cleanup(thread_a));
+			Paras::schedule_para_cleanup(thread_a);
 
 			// start a new session to activate, 5 validators for 5 cores.
 			run_to_block(3, |number| match number {
