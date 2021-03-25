@@ -51,6 +51,13 @@ enum SinkState<T> {
 /// The sink half of a single-item sink that does not resolve until the item has been read.
 pub struct SingleItemSink<T>(Arc<Mutex<SinkState<T>>>);
 
+// Derive clone not possible, as it puts `Clone` constraint on `T` which is not sensible here.
+impl<T> Clone for SingleItemSink<T> {
+	fn clone(&self) -> Self {
+		Self(self.0.clone())
+	}
+}
+
 /// The stream half of a single-item sink.
 pub struct SingleItemStream<T>(Arc<Mutex<SinkState<T>>>);
 
@@ -191,15 +198,14 @@ impl<M: Send + 'static, S: SpawnNamed + Send + 'static> SubsystemContext
 		Ok(())
 	}
 
-	async fn send_message(&mut self, msg: AllMessages) -> SubsystemResult<()> {
+	async fn send_message(&mut self, msg: AllMessages) {
 		self.tx
 			.send(msg)
 			.await
 			.expect("test overseer no longer live");
-		Ok(())
 	}
 
-	async fn send_messages<T>(&mut self, msgs: T) -> SubsystemResult<()>
+	async fn send_messages<T>(&mut self, msgs: T)
 	where
 		T: IntoIterator<Item = AllMessages> + Send,
 		T::IntoIter: Send,
@@ -209,15 +215,19 @@ impl<M: Send + 'static, S: SpawnNamed + Send + 'static> SubsystemContext
 			.send_all(&mut iter)
 			.await
 			.expect("test overseer no longer live");
-
-		Ok(())
 	}
 }
 
 /// A handle for interacting with the subsystem context.
 pub struct TestSubsystemContextHandle<M> {
-	tx: SingleItemSink<FromOverseer<M>>,
-	rx: mpsc::UnboundedReceiver<AllMessages>,
+	/// Direct access to sender of messages.
+	///
+	/// Useful for shared ownership situations (one can have multiple senders, but only one
+	/// receiver.
+	pub tx: SingleItemSink<FromOverseer<M>>,
+
+	/// Direct access to the receiver.
+	pub rx: mpsc::UnboundedReceiver<AllMessages>,
 }
 
 impl<M> TestSubsystemContextHandle<M> {
@@ -341,7 +351,7 @@ mod tests {
 
 		spawner.spawn("overseer", overseer.run().then(|_| async { () }).boxed());
 
-		block_on(handler.send_msg(CandidateSelectionMessage::Invalid(Default::default(), Default::default()))).unwrap();
+		block_on(handler.send_msg(CandidateSelectionMessage::Invalid(Default::default(), Default::default())));
 		assert!(matches!(block_on(rx.into_future()).0.unwrap(), CandidateSelectionMessage::Invalid(_, _)));
 	}
 }

@@ -23,91 +23,34 @@ use futures::{
 	channel::{mpsc, oneshot},
 	prelude::*,
 };
+use sp_keystore::SyncCryptoStorePtr;
 use polkadot_node_subsystem::{
+	jaeger, PerLeafSpan,
 	errors::ChainApiError,
 	messages::{
 		AllMessages, CandidateBackingMessage, CandidateSelectionMessage, CollatorProtocolMessage,
+		RuntimeApiRequest,
 	},
 };
 use polkadot_node_subsystem_util::{
-	self as util, delegated_subsystem, JobTrait, ToJobTrait,
-	metrics::{self, prometheus},
+	self as util, request_from_runtime, request_validator_groups, delegated_subsystem,
+	JobTrait, FromJobCommand, Validator, metrics::{self, prometheus},
 };
-use polkadot_primitives::v1::{CandidateReceipt, CollatorId, Hash, Id as ParaId, PoV};
-use std::{convert::TryFrom, pin::Pin};
+use polkadot_primitives::v1::{
+	CandidateReceipt, CollatorId, CoreState, CoreIndex, Hash, Id as ParaId, PoV, BlockNumber,
+};
+use polkadot_node_primitives::SignedFullStatement;
+use std::{pin::Pin, sync::Arc};
 use thiserror::Error;
 
-const TARGET: &'static str = "candidate_selection";
+const LOG_TARGET: &'static str = "parachain::candidate-selection";
 
 struct CandidateSelectionJob {
-	sender: mpsc::Sender<FromJob>,
-	receiver: mpsc::Receiver<ToJob>,
+	assignment: ParaId,
+	sender: mpsc::Sender<FromJobCommand>,
+	receiver: mpsc::Receiver<CandidateSelectionMessage>,
 	metrics: Metrics,
 	seconded_candidate: Option<CollatorId>,
-}
-
-/// This enum defines the messages that the provisioner is prepared to receive.
-#[derive(Debug)]
-pub enum ToJob {
-	/// The provisioner message is the main input to the provisioner.
-	CandidateSelection(CandidateSelectionMessage),
-	/// This message indicates that the provisioner should shut itself down.
-	Stop,
-}
-
-impl ToJobTrait for ToJob {
-	const STOP: Self = Self::Stop;
-
-	fn relay_parent(&self) -> Option<Hash> {
-		match self {
-			Self::CandidateSelection(csm) => csm.relay_parent(),
-			Self::Stop => None,
-		}
-	}
-}
-
-impl TryFrom<AllMessages> for ToJob {
-	type Error = ();
-
-	fn try_from(msg: AllMessages) -> Result<Self, Self::Error> {
-		match msg {
-			AllMessages::CandidateSelection(csm) => Ok(Self::CandidateSelection(csm)),
-			_ => Err(()),
-		}
-	}
-}
-
-impl From<CandidateSelectionMessage> for ToJob {
-	fn from(csm: CandidateSelectionMessage) -> Self {
-		Self::CandidateSelection(csm)
-	}
-}
-
-#[derive(Debug)]
-enum FromJob {
-	Backing(CandidateBackingMessage),
-	Collator(CollatorProtocolMessage),
-}
-
-impl From<FromJob> for AllMessages {
-	fn from(from_job: FromJob) -> AllMessages {
-		match from_job {
-			FromJob::Backing(msg) => AllMessages::CandidateBacking(msg),
-			FromJob::Collator(msg) => AllMessages::CollatorProtocol(msg),
-		}
-	}
-}
-
-impl TryFrom<AllMessages> for FromJob {
-	type Error = ();
-
-	fn try_from(msg: AllMessages) -> Result<Self, Self::Error> {
-		match msg {
-			AllMessages::CandidateBacking(msg) => Ok(FromJob::Backing(msg)),
-			AllMessages::CollatorProtocol(msg) => Ok(FromJob::Collator(msg)),
-			_ => Err(()),
-		}
-	}
 }
 
 #[derive(Debug, Error)]
@@ -122,71 +65,192 @@ enum Error {
 	ChainApi(#[from] ChainApiError),
 }
 
+macro_rules! try_runtime_api {
+	($x: expr) => {
+		match $x {
+			Ok(x) => x,
+			Err(e) => {
+				tracing::warn!(
+					target: LOG_TARGET,
+					err = ?e,
+					"Failed to fetch runtime API data for job",
+				);
+
+				// We can't do candidate selection work if we don't have the
+				// requisite runtime API data. But these errors should not take
+				// down the node.
+				return Ok(());
+			}
+		}
+	}
+}
+
 impl JobTrait for CandidateSelectionJob {
-	type ToJob = ToJob;
-	type FromJob = FromJob;
+	type ToJob = CandidateSelectionMessage;
 	type Error = Error;
-	type RunArgs = ();
+	type RunArgs = SyncCryptoStorePtr;
 	type Metrics = Metrics;
 
 	const NAME: &'static str = "CandidateSelectionJob";
 
-	/// Run a job for the parent block indicated
-	//
-	// this function is in charge of creating and executing the job's main loop
+	#[tracing::instrument(skip(keystore, metrics, receiver, sender), fields(subsystem = LOG_TARGET))]
 	fn run(
-		_relay_parent: Hash,
-		_run_args: Self::RunArgs,
+		relay_parent: Hash,
+		span: Arc<jaeger::Span>,
+		keystore: Self::RunArgs,
 		metrics: Self::Metrics,
-		receiver: mpsc::Receiver<ToJob>,
-		sender: mpsc::Sender<FromJob>,
+		receiver: mpsc::Receiver<CandidateSelectionMessage>,
+		mut sender: mpsc::Sender<FromJobCommand>,
 	) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> {
-		Box::pin(async move {
-			let job = CandidateSelectionJob::new(metrics, sender, receiver);
+		let span = PerLeafSpan::new(span, "candidate-selection");
+		async move {
+			let _span = span.child("query-runtime")
+				.with_relay_parent(relay_parent)
+				.with_stage(jaeger::Stage::CandidateSelection);
+			let (groups, cores) = futures::try_join!(
+				try_runtime_api!(request_validator_groups(relay_parent, &mut sender).await),
+				try_runtime_api!(request_from_runtime(
+					relay_parent,
+					&mut sender,
+					|tx| RuntimeApiRequest::AvailabilityCores(tx),
+				).await),
+			)?;
 
-			// it isn't necessary to break run_loop into its own function,
-			// but it's convenient to separate the concerns in this way
-			job.run_loop().await
-		})
+			let (validator_groups, group_rotation_info) = try_runtime_api!(groups);
+			let cores = try_runtime_api!(cores);
+
+			drop(_span);
+			let _span = span.child("validator-construction")
+				.with_relay_parent(relay_parent)
+				.with_stage(jaeger::Stage::CandidateSelection);
+
+			let n_cores = cores.len();
+
+			let validator = match Validator::new(relay_parent, keystore.clone(), sender.clone()).await {
+				Ok(validator) => validator,
+				Err(util::Error::NotAValidator) => return Ok(()),
+				Err(err) => return Err(Error::Util(err)),
+			};
+
+			let assignment_span = span.child("find-assignment")
+				.with_relay_parent(relay_parent)
+				.with_stage(jaeger::Stage::CandidateSelection);
+
+			#[derive(Debug)]
+			enum AssignmentState {
+				Unassigned,
+				Scheduled(ParaId),
+				Occupied(BlockNumber),
+				Free,
+			}
+
+			let mut assignment = AssignmentState::Unassigned;
+
+			for (idx, core) in cores.into_iter().enumerate() {
+				let core_index = CoreIndex(idx as _);
+				let group_index = group_rotation_info.group_for_core(core_index, n_cores);
+				if let Some(g) = validator_groups.get(group_index.0 as usize) {
+					if g.contains(&validator.index()) {
+						match core {
+							CoreState::Scheduled(scheduled) => {
+								assignment = AssignmentState::Scheduled(scheduled.para_id);
+							}
+							CoreState::Occupied(occupied) => {
+								// Ignore prospective assignments on occupied cores
+								// for the time being.
+								assignment = AssignmentState::Occupied(occupied.occupied_since);
+							}
+							CoreState::Free => {
+								assignment = AssignmentState::Free;
+							}
+						}
+						break;
+					}
+				}
+			}
+
+			let (assignment, assignment_span) = match assignment {
+				AssignmentState::Scheduled(assignment) => {
+					let assignment_span = assignment_span
+					.with_string_tag("assigned", "true")
+					.with_para_id(assignment);
+
+					(assignment, assignment_span)
+				}
+				assignment => {
+					let _assignment_span = assignment_span.with_string_tag("assigned", "false");
+
+					let validator_index = validator.index();
+					let validator_id = validator.id();
+
+					tracing::debug!(
+						target: LOG_TARGET,
+						?relay_parent,
+						?validator_index,
+						?validator_id,
+						?assignment,
+						"No assignment. Will not select candidate."
+					);
+
+					return Ok(())
+				}
+			};
+
+			drop(assignment_span);
+
+			CandidateSelectionJob::new(assignment, metrics, sender, receiver).run_loop(&span).await
+		}.boxed()
 	}
 }
 
 impl CandidateSelectionJob {
 	pub fn new(
+		assignment: ParaId,
 		metrics: Metrics,
-		sender: mpsc::Sender<FromJob>,
-		receiver: mpsc::Receiver<ToJob>,
+		sender: mpsc::Sender<FromJobCommand>,
+		receiver: mpsc::Receiver<CandidateSelectionMessage>,
 	) -> Self {
 		Self {
 			sender,
 			receiver,
 			metrics,
+			assignment,
 			seconded_candidate: None,
 		}
 	}
 
-	async fn run_loop(mut self) -> Result<(), Error> {
-		self.run_loop_borrowed().await
-	}
+	async fn run_loop(&mut self, span: &jaeger::Span) -> Result<(), Error> {
+		let span = span.child("run-loop")
+			.with_stage(jaeger::Stage::CandidateSelection);
 
-	/// this function exists for testing and should not generally be used; use `run_loop` instead.
-	async fn run_loop_borrowed(&mut self) -> Result<(), Error> {
-		while let Some(msg) = self.receiver.next().await {
-			match msg {
-				ToJob::CandidateSelection(CandidateSelectionMessage::Collation(
+		loop {
+			match self.receiver.next().await  {
+				Some(CandidateSelectionMessage::Collation(
 					relay_parent,
 					para_id,
 					collator_id,
 				)) => {
+					let _span = span.child("handle-collation");
 					self.handle_collation(relay_parent, para_id, collator_id).await;
 				}
-				ToJob::CandidateSelection(CandidateSelectionMessage::Invalid(
-					_,
+				Some(CandidateSelectionMessage::Invalid(
+					_relay_parent,
 					candidate_receipt,
 				)) => {
+					let _span = span.child("handle-invalid")
+						.with_stage(jaeger::Stage::CandidateSelection)
+						.with_candidate(candidate_receipt.hash())
+						.with_relay_parent(_relay_parent);
 					self.handle_invalid(candidate_receipt).await;
 				}
-				ToJob::Stop => break,
+				Some(CandidateSelectionMessage::Seconded(_relay_parent, statement)) => {
+					let _span = span.child("handle-seconded")
+						.with_stage(jaeger::Stage::CandidateSelection)
+						.with_candidate(statement.payload().candidate_hash())
+						.with_relay_parent(_relay_parent);
+					self.handle_seconded(statement).await;
+				}
+				None => break,
 			}
 		}
 
@@ -196,12 +260,32 @@ impl CandidateSelectionJob {
 		Ok(())
 	}
 
+	#[tracing::instrument(level = "trace", skip(self), fields(subsystem = LOG_TARGET))]
 	async fn handle_collation(
 		&mut self,
 		relay_parent: Hash,
 		para_id: ParaId,
 		collator_id: CollatorId,
 	) {
+		let _timer = self.metrics.time_handle_collation();
+
+		if self.assignment != para_id {
+			tracing::info!(
+				target: LOG_TARGET,
+				"Collator {:?} sent a collation outside of our assignment {:?}",
+				collator_id,
+				para_id,
+			);
+			if let Err(err) = forward_invalidity_note(&collator_id, &mut self.sender).await {
+				tracing::warn!(
+					target: LOG_TARGET,
+					err = ?err,
+					"failed to forward invalidity note",
+				);
+			}
+			return;
+		}
+
 		if self.seconded_candidate.is_none() {
 			let (candidate_receipt, pov) =
 				match get_collation(
@@ -212,10 +296,10 @@ impl CandidateSelectionJob {
 				).await {
 					Ok(response) => response,
 					Err(err) => {
-						log::warn!(
-							target: TARGET,
-							"failed to get collation from collator protocol subsystem: {:?}",
-							err
+						tracing::warn!(
+							target: LOG_TARGET,
+							err = ?err,
+							"failed to get collation from collator protocol subsystem",
 						);
 						return;
 					}
@@ -227,38 +311,39 @@ impl CandidateSelectionJob {
 				pov,
 				&mut self.sender,
 				&self.metrics,
-			)
-			.await
-			{
-				Err(err) => log::warn!(target: TARGET, "failed to second a candidate: {:?}", err),
+			).await {
+				Err(err) => tracing::warn!(target: LOG_TARGET, err = ?err, "failed to second a candidate"),
 				Ok(()) => self.seconded_candidate = Some(collator_id),
 			}
 		}
 	}
 
+	#[tracing::instrument(level = "trace", skip(self), fields(subsystem = LOG_TARGET))]
 	async fn handle_invalid(&mut self, candidate_receipt: CandidateReceipt) {
+		let _timer = self.metrics.time_handle_invalid();
+
 		let received_from = match &self.seconded_candidate {
 			Some(peer) => peer,
 			None => {
-				log::warn!(
-					target: TARGET,
+				tracing::warn!(
+					target: LOG_TARGET,
 					"received invalidity notice for a candidate we don't remember seconding"
 				);
 				return;
 			}
 		};
-		log::info!(
-			target: TARGET,
-			"received invalidity note for candidate {:?}",
-			candidate_receipt
+		tracing::info!(
+			target: LOG_TARGET,
+			candidate_receipt = ?candidate_receipt,
+			"received invalidity note for candidate",
 		);
 
 		let result =
 			if let Err(err) = forward_invalidity_note(received_from, &mut self.sender).await {
-				log::warn!(
-					target: TARGET,
-					"failed to forward invalidity note: {:?}",
-					err
+				tracing::warn!(
+					target: LOG_TARGET,
+					err = ?err,
+					"failed to forward invalidity note",
 				);
 				Err(())
 			} else {
@@ -266,25 +351,66 @@ impl CandidateSelectionJob {
 			};
 		self.metrics.on_invalid_selection(result);
 	}
+
+	async fn handle_seconded(&mut self, statement: SignedFullStatement) {
+		let received_from = match &self.seconded_candidate {
+			Some(peer) => peer,
+			None => {
+				tracing::warn!(
+					target: LOG_TARGET,
+					"received seconded notice for a candidate we don't remember seconding"
+				);
+				return;
+			}
+		};
+		tracing::debug!(
+			target: LOG_TARGET,
+			statement = ?statement,
+			"received seconded note for candidate",
+		);
+
+		if let Err(e) = self.sender
+			.send(AllMessages::from(CollatorProtocolMessage::NoteGoodCollation(received_from.clone())).into()).await
+		{
+			tracing::debug!(
+				target: LOG_TARGET,
+				error = ?e,
+				"failed to note good collator"
+			);
+		}
+
+		if let Err(e) = self.sender
+			.send(AllMessages::from(
+				CollatorProtocolMessage::NotifyCollationSeconded(received_from.clone(), statement)
+			).into()).await
+		{
+			tracing::debug!(
+				target: LOG_TARGET,
+				error = ?e,
+				"failed to notify collator about seconded collation"
+			);
+		}
+	}
 }
 
 // get a collation from the Collator Protocol subsystem
 //
 // note that this gets an owned clone of the sender; that's becuase unlike `forward_invalidity_note`, it's expected to take a while longer
+#[tracing::instrument(level = "trace", skip(sender), fields(subsystem = LOG_TARGET))]
 async fn get_collation(
 	relay_parent: Hash,
 	para_id: ParaId,
 	collator_id: CollatorId,
-	mut sender: mpsc::Sender<FromJob>,
+	mut sender: mpsc::Sender<FromJobCommand>,
 ) -> Result<(CandidateReceipt, PoV), Error> {
 	let (tx, rx) = oneshot::channel();
 	sender
-		.send(FromJob::Collator(CollatorProtocolMessage::FetchCollation(
+		.send(AllMessages::from(CollatorProtocolMessage::FetchCollation(
 			relay_parent,
 			collator_id,
 			para_id,
 			tx,
-		)))
+		)).into())
 		.await?;
 	rx.await.map_err(Into::into)
 }
@@ -293,19 +419,19 @@ async fn second_candidate(
 	relay_parent: Hash,
 	candidate_receipt: CandidateReceipt,
 	pov: PoV,
-	sender: &mut mpsc::Sender<FromJob>,
+	sender: &mut mpsc::Sender<FromJobCommand>,
 	metrics: &Metrics,
 ) -> Result<(), Error> {
 	match sender
-		.send(FromJob::Backing(CandidateBackingMessage::Second(
+		.send(AllMessages::from(CandidateBackingMessage::Second(
 			relay_parent,
 			candidate_receipt,
 			pov,
-		)))
+		)).into())
 		.await
 	{
 		Err(err) => {
-			log::warn!(target: TARGET, "failed to send a seconding message");
+			tracing::warn!(target: LOG_TARGET, err = ?err, "failed to send a seconding message");
 			metrics.on_second(Err(()));
 			Err(err.into())
 		}
@@ -318,12 +444,12 @@ async fn second_candidate(
 
 async fn forward_invalidity_note(
 	received_from: &CollatorId,
-	sender: &mut mpsc::Sender<FromJob>,
+	sender: &mut mpsc::Sender<FromJobCommand>,
 ) -> Result<(), Error> {
 	sender
-		.send(FromJob::Collator(CollatorProtocolMessage::ReportCollator(
+		.send(AllMessages::from(CollatorProtocolMessage::ReportCollator(
 			received_from.clone(),
-		)))
+		)).into())
 		.await
 		.map_err(Into::into)
 }
@@ -332,6 +458,8 @@ async fn forward_invalidity_note(
 struct MetricsInner {
 	seconds: prometheus::CounterVec<prometheus::U64>,
 	invalid_selections: prometheus::CounterVec<prometheus::U64>,
+	handle_collation: prometheus::Histogram,
+	handle_invalid: prometheus::Histogram,
 }
 
 /// Candidate selection metrics.
@@ -351,6 +479,16 @@ impl Metrics {
 			let label = if result.is_ok() { "succeeded" } else { "failed" };
 			metrics.invalid_selections.with_label_values(&[label]).inc();
 		}
+	}
+
+	/// Provide a timer for `handle_collation` which observes on drop.
+	fn time_handle_collation(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
+		self.0.as_ref().map(|metrics| metrics.handle_collation.start_timer())
+	}
+
+	/// Provide a timer for `handle_invalid` which observes on drop.
+	fn time_handle_invalid(&self) -> Option<metrics::prometheus::prometheus::HistogramTimer> {
+		self.0.as_ref().map(|metrics| metrics.handle_invalid.start_timer())
 	}
 }
 
@@ -377,12 +515,30 @@ impl metrics::Metrics for Metrics {
 				)?,
 				registry,
 			)?,
+			handle_collation: prometheus::register(
+				prometheus::Histogram::with_opts(
+					prometheus::HistogramOpts::new(
+						"parachain_candidate_selection_handle_collation",
+						"Time spent within `candidate_selection::handle_collation`",
+					)
+				)?,
+				registry,
+			)?,
+			handle_invalid: prometheus::register(
+				prometheus::Histogram::with_opts(
+					prometheus::HistogramOpts::new(
+						"parachain_candidate_selection:handle_invalid",
+						"Time spent within `candidate_selection::handle_invalid`",
+					)
+				)?,
+				registry,
+			)?,
 		};
 		Ok(Metrics(Some(metrics)))
 	}
 }
 
-delegated_subsystem!(CandidateSelectionJob((), Metrics) <- ToJob as CandidateSelectionSubsystem);
+delegated_subsystem!(CandidateSelectionJob(SyncCryptoStorePtr, Metrics) <- CandidateSelectionMessage as CandidateSelectionSubsystem);
 
 #[cfg(test)]
 mod tests {
@@ -398,13 +554,14 @@ mod tests {
 		postconditions: Postconditions,
 	) where
 		Preconditions: FnOnce(&mut CandidateSelectionJob),
-		TestBuilder: FnOnce(mpsc::Sender<ToJob>, mpsc::Receiver<FromJob>) -> Test,
+		TestBuilder: FnOnce(mpsc::Sender<CandidateSelectionMessage>, mpsc::Receiver<FromJobCommand>) -> Test,
 		Test: Future<Output = ()>,
 		Postconditions: FnOnce(CandidateSelectionJob, Result<(), Error>),
 	{
 		let (to_job_tx, to_job_rx) = mpsc::channel(0);
 		let (from_job_tx, from_job_rx) = mpsc::channel(0);
 		let mut job = CandidateSelectionJob {
+			assignment: 123.into(),
 			sender: from_job_tx,
 			receiver: to_job_rx,
 			metrics: Default::default(),
@@ -412,10 +569,10 @@ mod tests {
 		};
 
 		preconditions(&mut job);
-
+		let span = jaeger::Span::Disabled;
 		let (_, job_result) = futures::executor::block_on(future::join(
 			test(to_job_tx, from_job_rx),
-			job.run_loop_borrowed(),
+			job.run_loop(&span),
 		));
 
 		postconditions(job, job_result);
@@ -441,12 +598,10 @@ mod tests {
 			|_job| {},
 			|mut to_job, mut from_job| async move {
 				to_job
-					.send(ToJob::CandidateSelection(
-						CandidateSelectionMessage::Collation(
-							relay_parent,
-							para_id,
-							collator_id_clone.clone(),
-						),
+					.send(CandidateSelectionMessage::Collation(
+						relay_parent,
+						para_id,
+						collator_id_clone.clone(),
 					))
 					.await
 					.unwrap();
@@ -454,12 +609,12 @@ mod tests {
 
 				while let Some(msg) = from_job.next().await {
 					match msg {
-						FromJob::Collator(CollatorProtocolMessage::FetchCollation(
+						FromJobCommand::SendMessage(AllMessages::CollatorProtocol(CollatorProtocolMessage::FetchCollation(
 							got_relay_parent,
 							collator_id,
 							got_para_id,
 							return_sender,
-						)) => {
+						))) => {
 							assert_eq!(got_relay_parent, relay_parent);
 							assert_eq!(got_para_id, para_id);
 							assert_eq!(collator_id, collator_id_clone);
@@ -468,11 +623,11 @@ mod tests {
 								.send((candidate_receipt.clone(), pov.clone()))
 								.unwrap();
 						}
-						FromJob::Backing(CandidateBackingMessage::Second(
+						FromJobCommand::SendMessage(AllMessages::CandidateBacking(CandidateBackingMessage::Second(
 							got_relay_parent,
 							got_candidate_receipt,
 							got_pov,
-						)) => {
+						))) => {
 							assert_eq!(got_relay_parent, relay_parent);
 							assert_eq!(got_candidate_receipt, candidate_receipt);
 							assert_eq!(got_pov, pov);
@@ -508,12 +663,10 @@ mod tests {
 			|job| job.seconded_candidate = Some(prev_collator_id.clone()),
 			|mut to_job, mut from_job| async move {
 				to_job
-					.send(ToJob::CandidateSelection(
-						CandidateSelectionMessage::Collation(
-							relay_parent,
-							para_id,
-							collator_id_clone,
-						),
+					.send(CandidateSelectionMessage::Collation(
+						relay_parent,
+						para_id,
+						collator_id_clone,
 					))
 					.await
 					.unwrap();
@@ -521,11 +674,11 @@ mod tests {
 
 				while let Some(msg) = from_job.next().await {
 					match msg {
-						FromJob::Backing(CandidateBackingMessage::Second(
+						FromJobCommand::SendMessage(AllMessages::CandidateBacking(CandidateBackingMessage::Second(
 							_got_relay_parent,
 							_got_candidate_receipt,
 							_got_pov,
-						)) => {
+						))) => {
 							*was_seconded_clone.lock().await = true;
 						}
 						other => panic!("unexpected message from job: {:?}", other),
@@ -557,18 +710,16 @@ mod tests {
 			|job| job.seconded_candidate = Some(collator_id.clone()),
 			|mut to_job, mut from_job| async move {
 				to_job
-					.send(ToJob::CandidateSelection(
-						CandidateSelectionMessage::Invalid(relay_parent, candidate_receipt),
-					))
+					.send(CandidateSelectionMessage::Invalid(relay_parent, candidate_receipt))
 					.await
 					.unwrap();
 				std::mem::drop(to_job);
 
 				while let Some(msg) = from_job.next().await {
 					match msg {
-						FromJob::Collator(CollatorProtocolMessage::ReportCollator(
+						FromJobCommand::SendMessage(AllMessages::CollatorProtocol(CollatorProtocolMessage::ReportCollator(
 							got_collator_id,
-						)) => {
+						))) => {
 							assert_eq!(got_collator_id, collator_id_clone);
 
 							*sent_report_clone.lock().await = true;

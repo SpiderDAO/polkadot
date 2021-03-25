@@ -19,47 +19,49 @@
 
 use sp_std::prelude::*;
 use sp_std::collections::btree_map::BTreeMap;
+use sp_runtime::traits::One;
 use primitives::v1::{
-	ValidatorId, ValidatorIndex, GroupRotationInfo, CoreState, ValidationData,
+	ValidatorId, ValidatorIndex, GroupRotationInfo, CoreState,
 	Id as ParaId, OccupiedCoreAssumption, SessionIndex, ValidationCode,
 	CommittedCandidateReceipt, ScheduledCore, OccupiedCore, CoreOccupied, CoreIndex,
-	GroupIndex, CandidateEvent, PersistedValidationData, AuthorityDiscoveryId,
-	InboundDownwardMessage, InboundHrmpMessage,
+	GroupIndex, CandidateEvent, PersistedValidationData, SessionInfo,
+	InboundDownwardMessage, InboundHrmpMessage, Hash, AuthorityDiscoveryId
 };
-use sp_runtime::traits::Zero;
-use frame_support::debug;
-use crate::{initializer, inclusion, scheduler, configuration, paras, router};
+use crate::{initializer, inclusion, scheduler, configuration, paras, session_info, dmp, hrmp, shared};
+
 
 /// Implementation for the `validators` function of the runtime API.
-pub fn validators<T: initializer::Trait>() -> Vec<ValidatorId> {
-	<inclusion::Module<T>>::validators()
+pub fn validators<T: initializer::Config>() -> Vec<ValidatorId> {
+	<shared::Module<T>>::active_validator_keys()
 }
 
 /// Implementation for the `validator_groups` function of the runtime API.
-pub fn validator_groups<T: initializer::Trait>() -> (
+pub fn validator_groups<T: initializer::Config>() -> (
 	Vec<Vec<ValidatorIndex>>,
 	GroupRotationInfo<T::BlockNumber>,
 ) {
+	let now = <frame_system::Pallet<T>>::block_number() + One::one();
+
 	let groups = <scheduler::Module<T>>::validator_groups();
-	let rotation_info = <scheduler::Module<T>>::group_rotation_info();
+	let rotation_info = <scheduler::Module<T>>::group_rotation_info(now);
 
 	(groups, rotation_info)
 }
 
 /// Implementation for the `availability_cores` function of the runtime API.
-pub fn availability_cores<T: initializer::Trait>() -> Vec<CoreState<T::BlockNumber>> {
+pub fn availability_cores<T: initializer::Config>() -> Vec<CoreState<T::Hash, T::BlockNumber>> {
 	let cores = <scheduler::Module<T>>::availability_cores();
 	let parachains = <paras::Module<T>>::parachains();
 	let config = <configuration::Module<T>>::config();
 
-	let rotation_info = <scheduler::Module<T>>::group_rotation_info();
+	let now = <frame_system::Pallet<T>>::block_number() + One::one();
+	<scheduler::Module<T>>::clear();
+	<scheduler::Module<T>>::schedule(Vec::new(), now);
+
+	let rotation_info = <scheduler::Module<T>>::group_rotation_info(now);
 
 	let time_out_at = |backed_in_number, availability_period| {
 		let time_out_at = backed_in_number + availability_period;
-
-		if rotation_info.group_rotation_frequency == Zero::zero() {
-			return time_out_at;
-		}
 
 		let current_window = rotation_info.last_rotation_at() + availability_period;
 		let next_rotation = rotation_info.next_rotation_at();
@@ -82,8 +84,11 @@ pub fn availability_cores<T: initializer::Trait>() -> Vec<CoreState<T::BlockNumb
 		match <scheduler::Module<T>>::group_assigned_to_core(core_index, backed_in_number) {
 			Some(g) => g,
 			None =>  {
-				debug::warn!("Could not determine the group responsible for core extracted \
-					from list of cores for some prior block in same session");
+				log::warn!(
+					target: "runtime::polkadot-api::v1",
+					"Could not determine the group responsible for core extracted \
+					from list of cores for some prior block in same session",
+				);
 
 				GroupIndex(0)
 			}
@@ -101,7 +106,6 @@ pub fn availability_cores<T: initializer::Trait>() -> Vec<CoreState<T::BlockNumb
 
 					let backed_in_number = pending_availability.backed_in_number().clone();
 					OccupiedCore {
-						para_id,
 						next_up_on_available: <scheduler::Module<T>>::next_up_on_available(
 							CoreIndex(i as u32)
 						),
@@ -118,6 +122,8 @@ pub fn availability_cores<T: initializer::Trait>() -> Vec<CoreState<T::BlockNumb
 							backed_in_number,
 							pending_availability.core_occupied(),
 						),
+						candidate_hash: pending_availability.candidate_hash(),
+						candidate_descriptor: pending_availability.candidate_descriptor().clone(),
 					}
 				}
 				CoreOccupied::Parathread(p) => {
@@ -128,7 +134,6 @@ pub fn availability_cores<T: initializer::Trait>() -> Vec<CoreState<T::BlockNumb
 
 					let backed_in_number = pending_availability.backed_in_number().clone();
 					OccupiedCore {
-						para_id,
 						next_up_on_available: <scheduler::Module<T>>::next_up_on_available(
 							CoreIndex(i as u32)
 						),
@@ -145,6 +150,8 @@ pub fn availability_cores<T: initializer::Trait>() -> Vec<CoreState<T::BlockNumb
 							backed_in_number,
 							pending_availability.core_occupied(),
 						),
+						candidate_hash: pending_availability.candidate_hash(),
+						candidate_descriptor: pending_availability.candidate_descriptor().clone(),
 					}
 				}
 			})
@@ -163,24 +170,24 @@ pub fn availability_cores<T: initializer::Trait>() -> Vec<CoreState<T::BlockNumb
 	core_states
 }
 
-fn with_assumption<Trait, T, F>(
+fn with_assumption<Config, T, F>(
 	para_id: ParaId,
 	assumption: OccupiedCoreAssumption,
 	build: F,
 ) -> Option<T> where
-	Trait: inclusion::Trait,
+	Config: inclusion::Config,
 	F: FnOnce() -> Option<T>,
 {
 	match assumption {
 		OccupiedCoreAssumption::Included => {
-			<inclusion::Module<Trait>>::force_enact(para_id);
+			<inclusion::Module<Config>>::force_enact(para_id);
 			build()
 		}
 		OccupiedCoreAssumption::TimedOut => {
 			build()
 		}
 		OccupiedCoreAssumption::Free => {
-			if <inclusion::Module<Trait>>::pending_availability(para_id).is_some() {
+			if <inclusion::Module<Config>>::pending_availability(para_id).is_some() {
 				None
 			} else {
 				build()
@@ -189,59 +196,34 @@ fn with_assumption<Trait, T, F>(
 	}
 }
 
-/// Implementation for the `full_validation_data` function of the runtime API.
-pub fn full_validation_data<T: initializer::Trait>(
-	para_id: ParaId,
-	assumption: OccupiedCoreAssumption,
-)
-	-> Option<ValidationData<T::BlockNumber>>
-{
-	with_assumption::<T, _, _>(
-		para_id,
-		assumption,
-		|| Some(ValidationData {
-			persisted: crate::util::make_persisted_validation_data::<T>(para_id)?,
-			transient: crate::util::make_transient_validation_data::<T>(para_id)?,
-		}),
-	)
-}
-
 /// Implementation for the `persisted_validation_data` function of the runtime API.
-pub fn persisted_validation_data<T: initializer::Trait>(
+pub fn persisted_validation_data<T: initializer::Config>(
 	para_id: ParaId,
 	assumption: OccupiedCoreAssumption,
 ) -> Option<PersistedValidationData<T::BlockNumber>> {
-	with_assumption::<T, _, _>(
-		para_id,
-		assumption,
-		|| crate::util::make_persisted_validation_data::<T>(para_id),
-	)
+	use parity_scale_codec::Decode as _;
+	let relay_parent_number = <frame_system::Pallet<T>>::block_number();
+	let relay_parent_storage_root = Hash::decode(&mut &sp_io::storage::root()[..])
+		.expect("storage root must decode to the Hash type; qed");
+	with_assumption::<T, _, _>(para_id, assumption, || {
+		crate::util::make_persisted_validation_data::<T>(
+			para_id,
+			relay_parent_number,
+			relay_parent_storage_root,
+		)
+	})
 }
 
 /// Implementation for the `check_validation_outputs` function of the runtime API.
-pub fn check_validation_outputs<T: initializer::Trait>(
+pub fn check_validation_outputs<T: initializer::Config>(
 	para_id: ParaId,
-	outputs: primitives::v1::ValidationOutputs,
+	outputs: primitives::v1::CandidateCommitments,
 ) -> bool {
-	match <inclusion::Module<T>>::check_validation_outputs(para_id, outputs) {
-		Ok(()) => true,
-		Err(e) => {
-			frame_support::debug::RuntimeLogger::init();
-			let err: &'static str = e.into();
-			log::debug!(
-				target: "candidate_validation",
-				"Validation outputs checking for parachain `{}` failed: {}",
-				u32::from(para_id),
-				err,
-			);
-
-			false
-		}
-	}
+	<inclusion::Module<T>>::check_validation_outputs_for_runtime_api(para_id, outputs)
 }
 
 /// Implementation for the `session_index_for_child` function of the runtime API.
-pub fn session_index_for_child<T: initializer::Trait>() -> SessionIndex {
+pub fn session_index_for_child<T: initializer::Config>() -> SessionIndex {
 	// Just returns the session index from `inclusion`. Runtime APIs follow
 	// initialization so the initializer will have applied any pending session change
 	// which is expected at the child of the block whose context the runtime API was invoked
@@ -249,11 +231,32 @@ pub fn session_index_for_child<T: initializer::Trait>() -> SessionIndex {
 	//
 	// Incidentally, this is also the rationale for why it is OK to query validators or
 	// occupied cores or etc. and expect the correct response "for child".
-	<inclusion::Module<T>>::session_index()
+	<shared::Module<T>>::session_index()
+}
+
+/// Implementation for the `AuthorityDiscoveryApi::authorities()` function of the runtime API.
+/// It is a heavy call, but currently only used for authority discovery, so it is fine.
+/// Gets next, current and some historical authority ids using session_info module.
+pub fn relevant_authority_ids<T: initializer::Config + pallet_authority_discovery::Config>() -> Vec<AuthorityDiscoveryId> {
+	let current_session_index = session_index_for_child::<T>();
+	let earliest_stored_session = <session_info::Module<T>>::earliest_stored_session();
+	let mut authority_ids = <pallet_authority_discovery::Module<T>>::next_authorities();
+
+	for session_index in earliest_stored_session..=current_session_index {
+		let info = <session_info::Module<T>>::session_info(session_index);
+		if let Some(mut info) = info {
+			authority_ids.append(&mut info.discovery_keys);
+		}
+	}
+
+	authority_ids.sort();
+	authority_ids.dedup();
+
+	authority_ids
 }
 
 /// Implementation for the `validation_code` function of the runtime API.
-pub fn validation_code<T: initializer::Trait>(
+pub fn validation_code<T: initializer::Config>(
 	para_id: ParaId,
 	assumption: OccupiedCoreAssumption,
 ) -> Option<ValidationCode> {
@@ -265,7 +268,7 @@ pub fn validation_code<T: initializer::Trait>(
 }
 
 /// Implementation for the `historical_validation_code` function of the runtime API.
-pub fn historical_validation_code<T: initializer::Trait>(
+pub fn historical_validation_code<T: initializer::Config>(
 	para_id: ParaId,
 	context_height: T::BlockNumber,
 ) -> Option<ValidationCode> {
@@ -273,7 +276,7 @@ pub fn historical_validation_code<T: initializer::Trait>(
 }
 
 /// Implementation for the `candidate_pending_availability` function of the runtime API.
-pub fn candidate_pending_availability<T: initializer::Trait>(para_id: ParaId)
+pub fn candidate_pending_availability<T: initializer::Config>(para_id: ParaId)
 	-> Option<CommittedCandidateReceipt<T::Hash>>
 {
 	<inclusion::Module<T>>::candidate_pending_availability(para_id)
@@ -284,55 +287,39 @@ pub fn candidate_pending_availability<T: initializer::Trait>(para_id: ParaId)
 // this means it can run in a different session than other runtime APIs at the same block.
 pub fn candidate_events<T, F>(extract_event: F) -> Vec<CandidateEvent<T::Hash>>
 where
-	T: initializer::Trait,
-	F: Fn(<T as frame_system::Trait>::Event) -> Option<inclusion::Event<T>>,
+	T: initializer::Config,
+	F: Fn(<T as frame_system::Config>::Event) -> Option<inclusion::Event<T>>,
 {
 	use inclusion::Event as RawEvent;
 
-	<frame_system::Module<T>>::events().into_iter()
+	<frame_system::Pallet<T>>::events().into_iter()
 		.filter_map(|record| extract_event(record.event))
 		.map(|event| match event {
-			RawEvent::<T>::CandidateBacked(c, h) => CandidateEvent::CandidateBacked(c, h),
-			RawEvent::<T>::CandidateIncluded(c, h) => CandidateEvent::CandidateIncluded(c, h),
-			RawEvent::<T>::CandidateTimedOut(c, h) => CandidateEvent::CandidateTimedOut(c, h),
+			RawEvent::<T>::CandidateBacked(c, h, core, group)
+				=> CandidateEvent::CandidateBacked(c, h, core, group),
+			RawEvent::<T>::CandidateIncluded(c, h, core, group)
+				=> CandidateEvent::CandidateIncluded(c, h, core, group),
+			RawEvent::<T>::CandidateTimedOut(c, h, core)
+				=> CandidateEvent::CandidateTimedOut(c, h, core),
 		})
 		.collect()
 }
 
-/// Get the `AuthorityDiscoveryId`s corresponding to the given `ValidatorId`s.
-/// Currently this request is limited to validators in the current session.
-///
-/// We assume that every validator runs authority discovery,
-/// which would allow us to establish point-to-point connection to given validators.
-// FIXME: handle previous sessions:
-// https://github.com/paritytech/polkadot/issues/1461
-pub fn validator_discovery<T>(validators: Vec<ValidatorId>) -> Vec<Option<AuthorityDiscoveryId>>
-where
-	T: initializer::Trait + pallet_authority_discovery::Trait,
-{
-	// FIXME: the mapping might be invalid if a session change happens in between the calls
-	// use SessionInfo from https://github.com/paritytech/polkadot/pull/1691
-	let current_validators = <inclusion::Module<T>>::validators();
-	let authorities = <pallet_authority_discovery::Module<T>>::authorities();
-	// We assume the same ordering in authorities as in validators so we can do an index search
-	validators.iter().map(|id| {
-		// FIXME: linear search is slow O(n^2)
-		// use SessionInfo from https://github.com/paritytech/polkadot/pull/1691
-		let validator_index = current_validators.iter().position(|v| v == id);
-		validator_index.and_then(|i| authorities.get(i).cloned())
-	}).collect()
+/// Get the session info for the given session, if stored.
+pub fn session_info<T: session_info::Config>(index: SessionIndex) -> Option<SessionInfo> {
+	<session_info::Module<T>>::session_info(index)
 }
 
 /// Implementation for the `dmq_contents` function of the runtime API.
-pub fn dmq_contents<T: router::Trait>(
+pub fn dmq_contents<T: dmp::Config>(
 	recipient: ParaId,
 ) -> Vec<InboundDownwardMessage<T::BlockNumber>> {
-	<router::Module<T>>::dmq_contents(recipient)
+	<dmp::Module<T>>::dmq_contents(recipient)
 }
 
 /// Implementation for the `inbound_hrmp_channels_contents` function of the runtime API.
-pub fn inbound_hrmp_channels_contents<T: router::Trait>(
+pub fn inbound_hrmp_channels_contents<T: hrmp::Config>(
 	recipient: ParaId,
 ) -> BTreeMap<ParaId, Vec<InboundHrmpMessage<T::BlockNumber>>> {
-	<router::Module<T>>::inbound_hrmp_channels_contents(recipient)
+	<hrmp::Module<T>>::inbound_hrmp_channels_contents(recipient)
 }

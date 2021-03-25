@@ -17,7 +17,7 @@
 //! Cross-Consensus Message format data structures.
 
 use core::result;
-use codec::{Encode, Decode};
+use parity_scale_codec::{Encode, Decode};
 
 use super::{MultiLocation, Xcm};
 
@@ -36,6 +36,8 @@ pub enum Error {
 	MultiLocationFull,
 	FailedToDecode,
 	BadOrigin,
+	ExceedsMaxMessageSize,
+	FailedToTransactAsset(#[codec(skip)] &'static str),
 }
 
 impl From<()> for Error {

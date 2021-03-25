@@ -18,10 +18,11 @@
 //! This subsystem implements both sides of the collator protocol.
 
 #![deny(missing_docs, unused_crate_dependencies)]
+#![recursion_limit="256"]
 
 use std::time::Duration;
+
 use futures::{channel::oneshot, FutureExt, TryFutureExt};
-use log::trace;
 use thiserror::Error;
 
 use polkadot_subsystem::{
@@ -32,7 +33,7 @@ use polkadot_subsystem::{
 	},
 };
 use polkadot_node_network_protocol::{
-	PeerId, ReputationChange as Rep,
+	PeerId, UnifiedReputationChange as Rep,
 };
 use polkadot_primitives::v1::CollatorId;
 use polkadot_node_subsystem_util::{
@@ -43,8 +44,7 @@ use polkadot_node_subsystem_util::{
 mod collator_side;
 mod validator_side;
 
-const LOG_TARGET: &'static str = "collator_protocol";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const LOG_TARGET: &'static str = "parachain::collator-protocol";
 
 #[derive(Debug, Error)]
 enum Error {
@@ -60,22 +60,22 @@ enum Error {
 	Prometheus(#[from] prometheus::PrometheusError),
 }
 
-impl From<util::validator_discovery::Error> for Error {
-	fn from(me: util::validator_discovery::Error) -> Self {
-		match me {
-			util::validator_discovery::Error::Subsystem(s) => Error::Subsystem(s),
-			util::validator_discovery::Error::RuntimeApi(ra) => Error::RuntimeApi(ra),
-			util::validator_discovery::Error::Oneshot(c) => Error::Oneshot(c),
-		}
+type Result<T> = std::result::Result<T, Error>;
+
+/// A collator eviction policy - how fast to evict collators which are inactive.
+#[derive(Debug, Clone, Copy)]
+pub struct CollatorEvictionPolicy(pub Duration);
+
+impl Default for CollatorEvictionPolicy {
+	fn default() -> Self {
+		CollatorEvictionPolicy(Duration::from_secs(24))
 	}
 }
-
-type Result<T> = std::result::Result<T, Error>;
 
 /// What side of the collator protocol is being engaged
 pub enum ProtocolSide {
 	/// Validators operate on the relay chain.
-	Validator(validator_side::Metrics),
+	Validator(CollatorEvictionPolicy, validator_side::Metrics),
 	/// Collators operate on a parachain.
 	Collator(CollatorId, collator_side::Metrics),
 }
@@ -96,14 +96,15 @@ impl CollatorProtocolSubsystem {
 		}
 	}
 
+	#[tracing::instrument(skip(self, ctx), fields(subsystem = LOG_TARGET))]
 	async fn run<Context>(self, ctx: Context) -> Result<()>
 	where
 		Context: SubsystemContext<Message = CollatorProtocolMessage>,
 	{
 		match self.protocol_side {
-			ProtocolSide::Validator(metrics) => validator_side::run(
+			ProtocolSide::Validator(policy, metrics) => validator_side::run(
 				ctx,
-				REQUEST_TIMEOUT,
+				policy,
 				metrics,
 			).await,
 			ProtocolSide::Collator(id, metrics) => collator_side::run(
@@ -135,18 +136,19 @@ where
 }
 
 /// Modify the reputation of a peer based on its behavior.
-async fn modify_reputation<Context>(ctx: &mut Context, peer: PeerId, rep: Rep) -> Result<()>
+#[tracing::instrument(level = "trace", skip(ctx), fields(subsystem = LOG_TARGET))]
+async fn modify_reputation<Context>(ctx: &mut Context, peer: PeerId, rep: Rep)
 where
-	Context: SubsystemContext<Message = CollatorProtocolMessage>,
+	Context: SubsystemContext,
 {
-	trace!(
+	tracing::trace!(
 		target: LOG_TARGET,
-		"Reputation change of {:?} for peer {:?}", rep, peer,
+		rep = ?rep,
+		peer_id = %peer,
+		"reputation change for peer",
 	);
 
 	ctx.send_message(AllMessages::NetworkBridge(
 		NetworkBridgeMessage::ReportPeer(peer, rep),
-	)).await?;
-
-	Ok(())
+	)).await;
 }

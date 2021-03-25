@@ -20,16 +20,20 @@
 
 use futures::prelude::*;
 use futures::select;
-use polkadot_node_subsystem::{messages::{AllMessages, ProvisionerInherentData, ProvisionerMessage}, SubsystemError};
+use polkadot_node_subsystem::{
+	jaeger,
+	messages::{AllMessages, ProvisionerInherentData, ProvisionerMessage}, SubsystemError,
+};
 use polkadot_overseer::OverseerHandler;
 use polkadot_primitives::v1::{
 	Block, Hash, Header,
 };
 use sc_block_builder::{BlockBuilderApi, BlockBuilderProvider};
+use sc_telemetry::TelemetryHandle;
 use sp_core::traits::SpawnNamed;
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_blockchain::HeaderBackend;
-use sp_consensus::{Proposal, RecordProof};
+use sp_consensus::{Proposal, DisableProofRecording};
 use sp_inherents::InherentData;
 use sp_runtime::traits::{DigestFor, HashFor};
 use sp_transaction_pool::TransactionPool;
@@ -37,11 +41,11 @@ use prometheus_endpoint::Registry as PrometheusRegistry;
 use std::{fmt, pin::Pin, sync::Arc, time};
 
 /// How long proposal can take before we give up and err out
-const PROPOSE_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(2);
+const PROPOSE_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(2500);
 
 /// Custom Proposer factory for Polkadot
 pub struct ProposerFactory<TxPool, Backend, Client> {
-	inner: sc_basic_authorship::ProposerFactory<TxPool, Backend, Client>,
+	inner: sc_basic_authorship::ProposerFactory<TxPool, Backend, Client, DisableProofRecording>,
 	overseer: OverseerHandler,
 }
 
@@ -52,6 +56,7 @@ impl<TxPool, Backend, Client> ProposerFactory<TxPool, Backend, Client> {
 		transaction_pool: Arc<TxPool>,
 		overseer: OverseerHandler,
 		prometheus: Option<&PrometheusRegistry>,
+		telemetry: Option<TelemetryHandle>,
 	) -> Self {
 		ProposerFactory {
 			inner: sc_basic_authorship::ProposerFactory::new(
@@ -59,6 +64,7 @@ impl<TxPool, Backend, Client> ProposerFactory<TxPool, Backend, Client> {
 				client,
 				transaction_pool,
 				prometheus,
+				telemetry,
 			),
 			overseer,
 		}
@@ -76,7 +82,7 @@ where
 		+ Send
 		+ Sync,
 	Client::Api:
-		BlockBuilderApi<Block> + ApiExt<Block, Error = sp_blockchain::Error>,
+		BlockBuilderApi<Block> + ApiExt<Block>,
 	Backend:
 		'static + sc_client_api::Backend<Block, State = sp_api::StateBackendFor<Client, Block>>,
 	// Rust bug: https://github.com/rust-lang/rust/issues/24159
@@ -95,11 +101,13 @@ where
 		// data to be moved into the future
 		let overseer = self.overseer.clone();
 		let parent_header_hash = parent_header.hash();
+		let parent_header = parent_header.clone();
 
 		async move {
 			Ok(Proposer {
 				inner: proposer?,
 				overseer,
+				parent_header,
 				parent_header_hash,
 			})
 		}.boxed()
@@ -111,8 +119,9 @@ where
 /// This proposer gets the ProvisionerInherentData and injects it into the wrapped
 /// proposer's inherent data, then delegates the actual proposal generation.
 pub struct Proposer<TxPool: TransactionPool<Block = Block>, Backend, Client> {
-	inner: sc_basic_authorship::Proposer<Backend, Block, Client, TxPool>,
+	inner: sc_basic_authorship::Proposer<Backend, Block, Client, TxPool, DisableProofRecording>,
 	overseer: OverseerHandler,
+	parent_header: Header,
 	parent_header_hash: Hash,
 }
 
@@ -127,7 +136,7 @@ where
 		+ Send
 		+ Sync,
 	Client::Api:
-		BlockBuilderApi<Block> + ApiExt<Block, Error = sp_blockchain::Error>,
+		BlockBuilderApi<Block> + ApiExt<Block>,
 	Backend:
 		'static + sc_client_api::Backend<Block, State = sp_api::StateBackendFor<Client, Block>>,
 	// Rust bug: https://github.com/rust-lang/rust/issues/24159
@@ -141,20 +150,23 @@ where
 		let mut overseer = self.overseer.clone();
 		let parent_header_hash = self.parent_header_hash.clone();
 
-		let (sender, receiver) = futures::channel::oneshot::channel();
+		let pid = async {
+			let (sender, receiver) = futures::channel::oneshot::channel();
+			overseer.wait_for_activation(parent_header_hash, sender).await;
+			receiver.await.map_err(|_| Error::ClosedChannelAwaitingActivation)??;
 
-		overseer.wait_for_activation(parent_header_hash, sender).await?;
-		receiver.await.map_err(|_| Error::ClosedChannelAwaitingActivation)??;
+			let (sender, receiver) = futures::channel::oneshot::channel();
+			overseer.send_msg(AllMessages::Provisioner(
+				ProvisionerMessage::RequestInherentData(parent_header_hash, sender),
+			)).await;
 
-		let (sender, receiver) = futures::channel::oneshot::channel();
-		overseer.send_msg(AllMessages::Provisioner(
-			ProvisionerMessage::RequestInherentData(parent_header_hash, sender),
-		)).await?;
+			receiver.await.map_err(|_| Error::ClosedChannelAwaitingInherentData)
+		};
 
 		let mut timeout = futures_timer::Delay::new(PROPOSE_TIMEOUT).fuse();
 
 		select! {
-			pid = receiver.fuse() => pid.map_err(|_| Error::ClosedChannelAwaitingInherentData),
+			pid = pid.fuse() => pid,
 			_ = timeout => Err(Error::Timeout),
 		}
 	}
@@ -170,7 +182,7 @@ where
 		+ Send
 		+ Sync,
 	Client::Api:
-		BlockBuilderApi<Block> + ApiExt<Block, Error = sp_blockchain::Error>,
+		BlockBuilderApi<Block> + ApiExt<Block>,
 	Backend:
 		'static + sc_client_api::Backend<Block, State = sp_api::StateBackendFor<Client, Block>>,
 	// Rust bug: https://github.com/rust-lang/rust/issues/24159
@@ -178,33 +190,45 @@ where
 {
 	type Transaction = sc_client_api::TransactionFor<Backend, Block>;
 	type Proposal = Pin<Box<
-		dyn Future<Output = Result<Proposal<Block, sp_api::TransactionFor<Client, Block>>, Error>> + Send,
+		dyn Future<Output = Result<Proposal<Block, sp_api::TransactionFor<Client, Block>, ()>, Error>> + Send,
 	>>;
 	type Error = Error;
+	type ProofRecording = DisableProofRecording;
+	type Proof = ();
 
 	fn propose(
 		self,
 		mut inherent_data: InherentData,
 		inherent_digests: DigestFor<Block>,
 		max_duration: time::Duration,
-		record_proof: RecordProof,
 	) -> Self::Proposal {
 		async move {
+			let span = jaeger::Span::new(self.parent_header_hash, "propose");
+			let _span = span.child("get-provisioner");
+
 			let provisioner_data = match self.get_provisioner_data().await {
 				Ok(pd) => pd,
 				Err(err) => {
-					log::warn!("could not get provisioner inherent data; injecting default data: {}", err);
+					tracing::warn!(err = ?err, "could not get provisioner inherent data; injecting default data");
 					Default::default()
 				}
 			};
 
+			drop(_span);
+
+			let inclusion_inherent_data = (
+				provisioner_data.0,
+				provisioner_data.1,
+				self.parent_header,
+			);
 			inherent_data.put_data(
 				polkadot_primitives::v1::INCLUSION_INHERENT_IDENTIFIER,
-				&provisioner_data,
+				&inclusion_inherent_data,
 			)?;
 
+			let _span = span.child("authorship-propose");
 			self.inner
-				.propose(inherent_data, inherent_digests, max_duration, record_proof)
+				.propose(inherent_data, inherent_digests, max_duration)
 				.await
 				.map_err(Into::into)
 		}

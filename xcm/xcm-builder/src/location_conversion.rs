@@ -18,7 +18,7 @@ use sp_std::marker::PhantomData;
 use sp_io::hashing::blake2_256;
 use sp_runtime::traits::AccountIdConversion;
 use frame_support::traits::Get;
-use codec::Encode;
+use parity_scale_codec::Encode;
 use xcm::v0::{MultiLocation, NetworkId, Junction};
 use xcm_executor::traits::LocationConversion;
 
@@ -122,5 +122,29 @@ impl<
 
 	fn try_into_location(who: AccountId) -> Result<MultiLocation, AccountId> {
 		Ok(Junction::AccountId32 { id: who.into(), network: Network::get() }.into())
+	}
+}
+
+pub struct AccountKey20Aliases<Network, AccountId>(PhantomData<(Network, AccountId)>);
+
+impl<
+	Network: Get<NetworkId>,
+	AccountId: From<[u8; 20]> + Into<[u8; 20]>
+> LocationConversion<AccountId> for AccountKey20Aliases<Network, AccountId> {
+	fn from_location(location: &MultiLocation) -> Option<AccountId> {
+		if let MultiLocation::X1(Junction::AccountKey20 { key, network }) = location {
+			if matches!(network, NetworkId::Any) || network == &Network::get() {
+				return Some((*key).into());
+			}
+		}
+		None
+	}
+
+	fn try_into_location(who: AccountId) -> Result<MultiLocation, AccountId> {
+		Ok(Junction::AccountKey20 {
+			key: who.into(),
+			network: Network::get(),
+		}
+		.into())
 	}
 }
