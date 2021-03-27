@@ -379,14 +379,14 @@ impl pallet_bounties::Config for Runtime {
 
 parameter_types! {
 	//pub const LaunchPeriod: BlockNumber = 28 * 24 * 60 * MINUTES;
-	pub const LaunchPeriod: BlockNumber = 7 * Days;
+	pub const LaunchPeriod: BlockNumber = 7 * DAYS;
 	//pub const VotingPeriod: BlockNumber = 28 * 24 * 60 * MINUTES;
-	pub const VotingPeriod: BlockNumber = 4 * Days;
+	pub const VotingPeriod: BlockNumber = 4 * DAYS;
 	//pub const FastTrackVotingPeriod: BlockNumber = 3 * 24 * 60 * MINUTES;
 	pub const FastTrackVotingPeriod: BlockNumber = 5 * MINUTES;
 	pub const InstantAllowed: bool = true;
 	pub const MinimumDeposit: Balance = 12 * DOLLARS;
-	pub const EnactmentPeriod: BlockNumber = 7 * Days;// 30 * 24 * 60 * MINUTES;
+	pub const EnactmentPeriod: BlockNumber = 7 * DAYS;// 30 * 24 * 60 * MINUTES;
 	pub const CooloffPeriod: BlockNumber = 1 * MINUTES;// 28 * 24 * 60 * MINUTES;
 	// One cent: $10,000 / MB
 	pub const PreimageByteDeposit: Balance = 1 * CENTS;
